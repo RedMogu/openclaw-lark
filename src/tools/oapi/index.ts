@@ -29,7 +29,7 @@ import {
   registerFeishuBitableAppTableViewTool,
 } from './bitable/index';
 import { registerGetUserTool, registerSearchUserTool } from './common/index';
-// import { registerFeishuMailTools } from "./mail/index";
+import { registerFeishuMailTools } from "./mail/index";
 import { registerFeishuSearchTools } from './search/index';
 import { registerFeishuDriveTools } from './drive/index';
 import { registerFeishuWikiTools } from './wiki/index';
@@ -50,6 +50,9 @@ export function registerOapiTools(api: OpenClawPluginApi) {
 
   // IM tools (user identity)
   registerFeishuImUserTools(api);
+
+  // Mail tools
+  registerFeishuMailTools(api);
 
   // Calendar tools
   registerFeishuCalendarCalendarTool(api);
