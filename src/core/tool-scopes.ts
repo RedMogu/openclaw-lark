@@ -15,6 +15,8 @@
  * 1. 在 `ToolActionKey` 类型中添加新键：
  *    ```typescript
  *    export type ToolActionKey =
+  | 'feishu_mail.list'
+  | 'feishu_mail.send'
  *      | "feishu_calendar_event.create"
  *      | "feishu_new_tool.action"  // 新增
  *    ```
@@ -57,6 +59,8 @@
  * 总计：96 个工具动作
  */
 export type ToolActionKey =
+  | 'feishu_mail.list'
+  | 'feishu_mail.send'
   | 'feishu_bitable_app.copy'
   | 'feishu_bitable_app.create'
   | 'feishu_bitable_app.get'
@@ -158,7 +162,7 @@ export type ToolActionKey =
  *
  * 将每个 ToolActionKey 映射到其所需的 scope 数组
  */
-export type ToolScopeMapping = Record<ToolActionKey, string[]>;
+export type ToolScopeMapping = Record<ToolActionKey | 'feishu_mail.list' | 'feishu_mail.send', string[]>;
 
 // ===== 数据 =====
 
@@ -183,6 +187,9 @@ export type ToolScopeMapping = Record<ToolActionKey, string[]>;
  * @see {@link ToolActionKey} 所有可用的工具动作键
  */
 export const TOOL_SCOPES: ToolScopeMapping = {
+  
+  'feishu_mail.list': ['mail:user_mailbox.message:readonly'],
+  'feishu_mail.send': ['mail:user_mailbox.message:send'],
   'feishu_bitable_app.create': ['base:app:create'],
   'feishu_bitable_app.get': ['base:app:read'],
   'feishu_bitable_app.list': ['space:document:retrieve'],

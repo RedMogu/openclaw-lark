@@ -1,6 +1,8 @@
+
 import { Type, Static } from '@sinclair/typebox';
 import type { OpenClawPluginApi } from 'openclaw/plugin-sdk';
 import { createToolContext, registerTool } from '../../helpers';
+import { json } from '../helpers';
 
 const FeishuMailSchema = Type.Object({
     action: Type.String({ enum: ['list', 'send'], description: '操作类型' }),
@@ -42,7 +44,7 @@ export function registerFeishuMailTool(api: OpenClawPluginApi) {
                     
                     const messageIds = listRes.data?.items || [];
                     if (messageIds.length === 0) {
-                        return JSON.stringify({ message: "No recent emails found in INBOX." });
+                        return json({ message: "No recent emails found in INBOX." });
                     }
                     
                     const details: any[] = [];
@@ -55,7 +57,7 @@ export function registerFeishuMailTool(api: OpenClawPluginApi) {
                                 }, opts); // <-- PASS OPTS HERE
                             }, { as: 'user' });
 
-                            const msg = rawRes.data?.message || {};
+                            const msg = (rawRes as any)?.data?.message || {};
                             
                             const subject = msg.subject || "No Subject";
                             const from = msg.head_from?.mail_address || "Unknown Sender";
@@ -72,7 +74,7 @@ export function registerFeishuMailTool(api: OpenClawPluginApi) {
                         }
                     }
 
-                    return JSON.stringify({ recent_emails: details }, null, 2);
+                    return json({ recent_emails: details });
                 }
                 case 'send': {
                     if (!params.to || !params.subject || !params.body) {
@@ -86,8 +88,9 @@ export function registerFeishuMailTool(api: OpenClawPluginApi) {
                     sendRes = await client.invoke('feishu_mail.send', async (sdk, opts) => {
                         log.info("MAIL SEND OPTS: " + JSON.stringify(opts));
                         try {
-                            return await sdk.mail.v1.userMailboxMessage.send({
-                                path: { user_mailbox_id: mailboxId },
+                            return await sdk.request({
+                                method: 'POST',
+                                url: `/open-apis/mail/v1/user_mailboxes/${mailboxId}/messages/send`,
                                 data: {
                                     subject: params.subject,
                                     to: toAddrs,
@@ -99,7 +102,7 @@ export function registerFeishuMailTool(api: OpenClawPluginApi) {
                         }
                     }, { as: 'user' });
                     
-                    return JSON.stringify({ success: true, message: 'Email sent successfully', ...sendRes.data }, null, 2);
+                    return json({ success: true, message: 'Email sent successfully', ...(sendRes as any)?.data });
                 }
                 default:
                     throw new Error(`Unsupported mail action: ${action}`);
