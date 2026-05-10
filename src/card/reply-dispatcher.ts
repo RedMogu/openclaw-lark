@@ -11,17 +11,17 @@
  * 4. Assembles and returns FeishuReplyDispatcherResult
  */
 
-import { createReplyPrefixContext } from 'openclaw/plugin-sdk/channel-runtime';
+import { createReplyPrefixContext, createTypingCallbacks } from 'openclaw/plugin-sdk/channel-runtime';
 import { logTypingFailure } from 'openclaw/plugin-sdk/channel-feedback';
 import type { ReplyPayload } from 'openclaw/plugin-sdk';
-import { createTypingCallbacks } from 'openclaw/plugin-sdk/channel-runtime';
 import { createAccountScopedConfig, getLarkAccount } from '../core/accounts';
 import { resolveFooterConfig } from '../core/footer-config';
 import { LarkClient } from '../core/lark-client';
 import { larkLogger } from '../core/lark-logger';
 import { sendMediaLark } from '../messaging/outbound/deliver';
 import { sendMarkdownCardFeishu, sendMessageFeishu } from '../messaging/outbound/send';
-import { addTypingIndicator, removeTypingIndicator, type TypingIndicatorState } from '../messaging/outbound/typing';
+import { type TypingIndicatorState, addTypingIndicator, removeTypingIndicator } from '../messaging/outbound/typing';
+import { splitReasoningText, stripReasoningTags } from './builder';
 import { isCardTableLimitError } from './card-error';
 import type { CreateFeishuReplyDispatcherParams, FeishuReplyDispatcherResult } from './reply-dispatcher-types';
 import { expandAutoMode, resolveReplyMode, shouldUseCard } from './reply-mode';
@@ -39,7 +39,7 @@ export type { CreateFeishuReplyDispatcherParams } from './reply-dispatcher-types
 
 export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherParams): FeishuReplyDispatcherResult {
   const core = LarkClient.runtime;
-  const { cfg, agentId, sessionKey, chatId, replyToMessageId, accountId, replyInThread } = params;
+  const { cfg, agentId, chatId, sessionKey, replyToMessageId, accountId, replyInThread } = params;
 
   // Resolve account so we can read per-account config (e.g. replyMode)
   const account = getLarkAccount(cfg, accountId);
@@ -61,6 +61,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
 
   // ---- Block streaming for static mode ----
   const enableBlockStreaming = feishuCfg?.blockStreaming === true && !useStreamingCards;
+  const { toolUseDisplay } = params;
 
   const resolvedFooter = resolveFooterConfig(feishuCfg?.footer);
 
@@ -96,6 +97,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
         chatId,
         replyToMessageId,
         replyInThread,
+        toolUseDisplay,
         resolvedFooter,
       })
     : null;
@@ -189,9 +191,10 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       await typingCallbacks.onReplyStart?.();
     },
 
-    deliver: async (payload: ReplyPayload) => {
+    deliver: async (payload: ReplyPayload, meta?: { kind?: string }) => {
       log.debug('deliver called', {
         textPreview: payload.text?.slice(0, 100),
+        kind: meta?.kind,
       });
 
       if (shouldSkip('deliver.entry')) return;
@@ -211,7 +214,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       }
 
       // 提取文本和媒体 URL
-      const text = payload.text ?? '';
+      const text = getVisiblePayloadText(payload);
       const payloadMediaUrls = payload.mediaUrls?.length
         ? payload.mediaUrls
         : payload.mediaUrl
@@ -224,15 +227,22 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
 
       // ---- Streaming card mode ----
       if (controller) {
-        await controller.ensureCardCreated();
-        if (controller.isTerminated) return;
-
-        if (controller.cardMessageId) {
-          await controller.onDeliver(payload);
+        if (meta?.kind === 'tool' && shouldRouteToolPayloadToCard(payload, toolUseDisplay.showToolUse)) {
+          await controller.onToolPayload(payload);
           return;
         }
-        // Card creation failed — fall through to static delivery
-        log.warn('deliver: card creation failed, falling back to static delivery');
+
+        if (text.trim()) {
+          await controller.ensureCardCreated();
+          if (controller.isTerminated) return;
+
+          if (controller.cardMessageId) {
+            await controller.onDeliver({ ...payload, text });
+            return;
+          }
+          // Card creation failed — fall through to static delivery
+          log.warn('deliver: card creation failed, falling back to static delivery');
+        }
       }
 
       // ---- Static text delivery ----
@@ -395,12 +405,21 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     dispatcher,
     replyOptions: {
       ...replyOptions,
-      onModelSelected: prefixContext.onModelSelected,
+      ...(controller
+        ? {
+            shouldEmitToolResult: () => false,
+            shouldEmitToolOutput: () => false,
+          }
+        : {}),
+      onModelSelected: (ctx: { provider: string; model: string; thinkLevel: string | undefined }) => {
+        prefixContext.onModelSelected(ctx);
+      },
       disableBlockStreaming: !enableBlockStreaming,
       ...(controller
         ? {
             onReasoningStream: (payload: ReplyPayload) => controller.onReasoningStream(payload),
             onPartialReply: (payload: ReplyPayload) => controller.onPartialReply(payload),
+            onToolStart: (payload: { name?: string; phase?: string }) => controller.onToolStart(payload),
           }
         : {}),
     },
@@ -411,4 +430,36 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     },
     abortCard,
   };
+}
+
+function getVisiblePayloadText(payload: ReplyPayload): string {
+  if (payload.isReasoning === true) return '';
+
+  const rawText = payload.text ?? '';
+  if (!rawText) return '';
+
+  const split = splitReasoningText(rawText);
+  if (split.answerText != null) {
+    return split.answerText;
+  }
+  return stripReasoningTags(rawText);
+}
+
+function shouldRouteToolPayloadToCard(payload: ReplyPayload, showToolUse: boolean): boolean {
+  if (!showToolUse) return false;
+  if (!getVisiblePayloadText(payload).trim()) return false;
+  if (payload.interactive) return false;
+  if (payload.btw) return false;
+  if (payload.audioAsVoice) return false;
+  if (payload.mediaUrl || (payload.mediaUrls?.length ?? 0) > 0) return false;
+
+  const execApproval =
+    payload.channelData && typeof payload.channelData === 'object' && !Array.isArray(payload.channelData)
+      ? payload.channelData.execApproval
+      : undefined;
+  if (execApproval && typeof execApproval === 'object' && !Array.isArray(execApproval)) {
+    return false;
+  }
+
+  return true;
 }

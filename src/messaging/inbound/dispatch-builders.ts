@@ -12,10 +12,10 @@
 import type { HistoryEntry } from 'openclaw/plugin-sdk/reply-history';
 import { buildPendingHistoryContextFromMap } from 'openclaw/plugin-sdk/reply-history';
 import type { MessageContext } from '../types';
-import type { DispatchContext } from './dispatch-context';
-import { LarkClient } from '../../core/lark-client';
-import { nonBotMentions } from './mention';
+import type { LarkClient } from '../../core/lark-client';
 import { threadScopedKey } from '../../channel/chat-queue';
+import type { DispatchContext } from './dispatch-context';
+import { nonBotMentions } from './mention';
 
 // ---------------------------------------------------------------------------
 // Mention annotation
@@ -34,7 +34,7 @@ export function buildMentionAnnotation(ctx: MessageContext): string | undefined 
   const mentions = nonBotMentions(ctx);
   if (mentions.length === 0) return undefined;
   const mentionDetails = mentions.map((t) => `${t.name} (open_id: ${t.openId})`).join(', ');
-  return `[System: This message @mentions the following users: ${mentionDetails}. Use these open_ids when performing actions involving these users.]`;
+  return `[System: This message @mentions the following users: ${mentionDetails}. Use these open_ids when performing actions involving these users. To @mention in a reply, use \`<at user_id="ou_xxx">Name</at>\`; plain "@Name" won't notify.]`;
 }
 
 // ---------------------------------------------------------------------------

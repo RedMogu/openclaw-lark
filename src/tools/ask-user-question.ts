@@ -14,17 +14,21 @@
  *
  * 所有卡片统一使用 form 容器，交互组件在本地缓存值，
  * 提交时通过 form_value 一次性回调，避免独立回调导致的 loading 闪烁。
+ *
+ * 注意：提交按钮必须设置 value 字段。飞书客户端会校验交互组件是否携带 value，
+ * 缺失时直接报 200340 错误，回调不会发送到服务端。虽然 form_submit 场景下
+ * form_value 是主要数据载体，但 value 作为按钮的合法性标记仍需存在。
  */
 
 import { randomUUID } from 'node:crypto';
-import type { OpenClawPluginApi, ClawdbotConfig } from 'openclaw/plugin-sdk';
+import type { ClawdbotConfig, OpenClawPluginApi } from 'openclaw/plugin-sdk';
 import { Type } from '@sinclair/typebox';
 import { getTicket, withTicket } from '../core/lark-ticket';
 import { larkLogger } from '../core/lark-logger';
 import { createCardEntity, sendCardByCardId, updateCardKitCard } from '../card/cardkit';
-import { checkToolRegistration, formatToolResult, formatToolError } from './helpers';
-import { enqueueFeishuChatTask, buildQueueKey } from '../channel/chat-queue';
+import { buildQueueKey, enqueueFeishuChatTask } from '../channel/chat-queue';
 import { handleFeishuMessage } from '../messaging/inbound/handler';
+import { checkToolRegistration, formatToolError, formatToolResult } from './helpers';
 
 const log = larkLogger('tools/ask-user-question');
 
@@ -195,11 +199,7 @@ function getSelectFieldName(questionIndex: number): string {
  *
  * @returns 卡片回调响应，或 undefined 表示非本模块的 action
  */
-export function handleAskUserAction(
-  data: unknown,
-  _cfg: ClawdbotConfig,
-  accountId: string,
-): unknown | undefined {
+export function handleAskUserAction(data: unknown, _cfg: ClawdbotConfig, accountId: string): unknown | undefined {
   let action: string | undefined;
   let operationId: string | undefined;
   let senderOpenId: string | undefined;
@@ -278,9 +278,7 @@ export function handleAskUserAction(
     if (operationId) {
       log.warn(`ask-user action: question ${operationId} not found (expired or already handled)`);
     }
-    return operationId
-      ? { toast: { type: 'info', content: '该问题已过期或已被回答' } }
-      : undefined;
+    return operationId ? { toast: { type: 'info', content: '该问题已过期或已被回答' } } : undefined;
   }
   if (ctx.submitted) {
     return { toast: { type: 'info', content: '该问题已提交，请等待处理' } };
@@ -333,13 +331,14 @@ export function handleAskUserAction(
   }
 
   // Mark as submitted (guard against double-submit & TTL expiry).
-  // Card stays in "待回答" state until synthetic message succeeds — this
-  // keeps the form submittable so the user can retry if injection fails.
   ctx.submitted = true;
 
+  // Build the intermediate "processing" card for immediate visual feedback.
+  const processingCard = buildProcessingCard(ctx.questions, answers);
+
   // Inject synthetic message with answers. On success, updates card to
-  // "answered" and consumes context. On failure, resets submitted flag
-  // so user can re-submit — card is still in its original form state.
+  // "answered" and consumes context. On failure, reverts card to submittable
+  // form state and resets submitted flag so user can re-submit.
   setImmediate(() => {
     injectAnswerSyntheticMessage(ctx, answers).catch((err) => {
       log.error(`unhandled error in injectAnswerSyntheticMessage: ${err}`);
@@ -347,7 +346,21 @@ export function handleAskUserAction(
   });
 
   log.info(`question ${operationId} submitted, synthetic message will be injected`);
-  return {};
+
+  // Return immediate visual feedback via Feishu callback response:
+  // - toast: ephemeral success message for the clicking user
+  // - card: replaces card content immediately for the clicking user
+  // Note: callback-return card does NOT consume a cardSequence number.
+  return {
+    toast: {
+      type: 'success' as const,
+      content: '已收到回答，正在处理...',
+    },
+    card: {
+      type: 'raw' as const,
+      data: processingCard,
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -359,10 +372,7 @@ export function handleAskUserAction(
  * them in a new turn. Follows the same pattern as oauth.ts for auth-complete
  * synthetic messages. Retries on failure to prevent answer loss.
  */
-async function injectAnswerSyntheticMessage(
-  ctx: QuestionContext,
-  answers: Record<string, string>,
-): Promise<void> {
+async function injectAnswerSyntheticMessage(ctx: QuestionContext, answers: Record<string, string>): Promise<void> {
   const syntheticMsgId = `${ctx.messageId}:ask-user-answer:${ctx.questionId}`;
 
   // Format answers as readable text for the AI
@@ -387,6 +397,25 @@ async function injectAnswerSyntheticMessage(
     log: (msg: string) => log.info(msg),
     error: (msg: string) => log.error(msg),
   };
+
+  // Update card to "processing" state via API so ALL viewers see it (not just
+  // the clicking user — the callback-return card field only updates for the
+  // clicker). Per Feishu docs, delayed update must execute AFTER the callback
+  // response — since we're in setImmediate, the callback has already returned.
+  try {
+    const processingCard = buildProcessingCard(ctx.questions, answers);
+    ctx.cardSequence++;
+    await updateCardKitCard({
+      cfg: ctx.cfg,
+      cardId: ctx.cardId,
+      card: processingCard,
+      sequence: ctx.cardSequence,
+      accountId: ctx.accountId,
+    });
+  } catch (err) {
+    log.warn(`failed to update card to processing state via API: ${err}`);
+    // Non-fatal: the clicking user already sees the processing state via callback return.
+  }
 
   let lastError: unknown;
   for (let attempt = 0; attempt <= INJECT_MAX_RETRIES; attempt++) {
@@ -445,10 +474,20 @@ async function injectAnswerSyntheticMessage(
   }
 
   // All retries exhausted — reset submitted flag so user can retry via card,
-  // and re-arm TTL so the entry doesn't live forever.
+  // revert card to submittable form state, and re-arm TTL.
   ctx.submitted = false;
   armTtlTimer(ctx, PENDING_QUESTION_TTL_MS);
-  log.error(`synthetic message injection failed after ${INJECT_MAX_RETRIES + 1} attempts for question ${ctx.questionId}: ${lastError}`);
+  log.error(
+    `synthetic message injection failed after ${INJECT_MAX_RETRIES + 1} attempts for question ${ctx.questionId}: ${lastError}`,
+  );
+
+  // Revert card from "processing" back to interactive form so user can retry.
+  try {
+    await updateCardToSubmittable(ctx);
+    log.info(`reverted card to submittable state for question ${ctx.questionId}`);
+  } catch (err) {
+    log.warn(`failed to revert card to submittable state: ${err}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -486,10 +525,7 @@ function readFormMultiSelect(formValue: Record<string, unknown>, fieldName: stri
 /**
  * Build a left-right row: label on left, control on right.
  */
-function buildLabeledRow(
-  label: Record<string, unknown>,
-  control: Record<string, unknown>,
-): Record<string, unknown> {
+function buildLabeledRow(label: Record<string, unknown>, control: Record<string, unknown>): Record<string, unknown> {
   return {
     tag: 'column_set',
     flex_mode: 'stretch',
@@ -520,10 +556,7 @@ function buildLabeledRow(
  * All controls use `name` for form_value collection. No `value` property
  * is set on interactive components — they do not fire individual callbacks.
  */
-function buildQuestionFormElements(
-  q: QuestionItem,
-  questionIndex: number,
-): Record<string, unknown>[] {
+function buildQuestionFormElements(q: QuestionItem, questionIndex: number): Record<string, unknown>[] {
   const elems: Record<string, unknown>[] = [];
   const labelMd = { tag: 'markdown', content: `**${q.header}**` };
 
@@ -609,12 +642,19 @@ function buildAskUserCard(questions: QuestionItem[], questionId: string): Record
     formElements.push(...buildQuestionFormElements(questions[i], i));
   }
 
-  // Submit button
+  // Submit button.
+  // questionId is encoded in both button name and value for resilience:
+  // - `value` is the primary carrier and is included in card.action.trigger
+  //   callbacks per Feishu's documented event structure.
+  // - `name` acts as a fallback in case the SDK version strips value
+  //   from form_submit events.
+  // Both are needed because a button without a `value` field fails
+  // Feishu's client-side interactive-component validation with code 200340.
   formElements.push({ tag: 'hr' });
   formElements.push({
     tag: 'button',
-    // Encode questionId in button name — value does NOT propagate for form submit buttons
     name: `${SUBMIT_BUTTON_PREFIX}${questionId}`,
+    value: { action: 'ask_user_submit', operation_id: questionId },
     text: {
       tag: 'plain_text',
       content: '📮 提交',
@@ -709,6 +749,59 @@ function buildAnsweredCard(questions: QuestionItem[], answers: Record<string, st
   };
 }
 
+function buildProcessingCard(questions: QuestionItem[], answers: Record<string, string>): Record<string, unknown> {
+  const elements: Record<string, unknown>[] = [];
+
+  for (let i = 0; i < questions.length; i++) {
+    const q = questions[i];
+    const answer = answers[q.question] ?? '(no answer)';
+    if (i > 0) {
+      elements.push({ tag: 'hr' });
+    }
+    elements.push(
+      buildLabeledRow(
+        { tag: 'markdown', content: `**${q.header}**` },
+        { tag: 'markdown', content: `⏳ **${answer}**` },
+      ),
+    );
+  }
+
+  elements.push({
+    tag: 'markdown',
+    content: '正在处理你的回答...',
+    text_size: 'notation',
+  });
+
+  return {
+    schema: '2.0',
+    config: V2_CONFIG,
+    header: {
+      title: {
+        tag: 'plain_text',
+        content: '已提交回答',
+        i18n_content: { zh_cn: '已提交回答', en_us: 'Response Submitted' },
+      },
+      subtitle: {
+        tag: 'plain_text',
+        content: `共 ${questions.length} 个问题 · 正在处理`,
+        i18n_content: {
+          zh_cn: `共 ${questions.length} 个问题 · 正在处理`,
+          en_us: `${questions.length} question${questions.length > 1 ? 's' : ''} · Processing`,
+        },
+      },
+      text_tag_list: [
+        {
+          tag: 'text_tag',
+          text: { tag: 'plain_text', content: '处理中' },
+          color: 'turquoise',
+        },
+      ],
+      template: 'turquoise',
+    },
+    body: { elements },
+  };
+}
+
 function buildExpiredCard(questions: QuestionItem[]): Record<string, unknown> {
   const elements: Record<string, unknown>[] = [];
 
@@ -718,10 +811,7 @@ function buildExpiredCard(questions: QuestionItem[]): Record<string, unknown> {
       elements.push({ tag: 'hr' });
     }
     elements.push(
-      buildLabeledRow(
-        { tag: 'markdown', content: `**${q.header}**` },
-        { tag: 'markdown', content: q.question },
-      ),
+      buildLabeledRow({ tag: 'markdown', content: `**${q.header}**` }, { tag: 'markdown', content: q.question }),
     );
   }
 
@@ -777,6 +867,18 @@ async function updateCardToAnswered(ctx: QuestionContext, answers: Record<string
 
 async function updateCardToExpired(ctx: QuestionContext): Promise<void> {
   const card = buildExpiredCard(ctx.questions);
+  ctx.cardSequence++;
+  await updateCardKitCard({
+    cfg: ctx.cfg,
+    cardId: ctx.cardId,
+    card,
+    sequence: ctx.cardSequence,
+    accountId: ctx.accountId,
+  });
+}
+
+async function updateCardToSubmittable(ctx: QuestionContext): Promise<void> {
+  const card = buildAskUserCard(ctx.questions, ctx.questionId);
   ctx.cardSequence++;
   await updateCardKitCard({
     cfg: ctx.cfg,

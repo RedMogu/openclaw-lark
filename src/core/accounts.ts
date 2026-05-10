@@ -9,17 +9,16 @@
  * unset fields fall back to the top-level defaults.
  */
 
-import { DEFAULT_ACCOUNT_ID } from 'openclaw/plugin-sdk/account-id';
-import { normalizeAccountId as _sdkNormalizeAccountId } from 'openclaw/plugin-sdk/account-id';
+import { DEFAULT_ACCOUNT_ID, normalizeAccountId as _sdkNormalizeAccountId } from 'openclaw/plugin-sdk/account-id';
 
 const normalizeAccountId: (id: string) => string | undefined =
-    typeof _sdkNormalizeAccountId === 'function'
-        ? _sdkNormalizeAccountId
-        : (id: string) => id?.trim().toLowerCase() || undefined;
+  typeof _sdkNormalizeAccountId === 'function'
+    ? _sdkNormalizeAccountId
+    : (id: string) => id?.trim().toLowerCase() || undefined;
 
 import type { ClawdbotConfig } from 'openclaw/plugin-sdk';
 
-import type { FeishuConfig, LarkBrand, LarkAccount, LarkCredentials, ConfiguredLarkAccount } from './types';
+import type { ConfiguredLarkAccount, FeishuConfig, LarkAccount, LarkBrand, LarkCredentials } from './types';
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -43,9 +42,30 @@ function baseConfig(section: FeishuConfig): Omit<FeishuConfig, 'accounts'> {
   return rest;
 }
 
-/** Merge base config with account override (account fields take precedence). */
+/** Merge base config with account override (account fields take precedence).
+ *  Performs a one-level deep merge for plain-object fields so that partial
+ *  account overrides (e.g. `footer: { model: false }`) are merged with
+ *  the base instead of replacing the entire object. */
 function mergeAccountConfig(base: Omit<FeishuConfig, 'accounts'>, override: Partial<FeishuConfig>): FeishuConfig {
-  return { ...base, ...override } as FeishuConfig;
+  const result: Record<string, unknown> = { ...base };
+  for (const [key, value] of Object.entries(override)) {
+    if (value === undefined) continue;
+    const baseVal = (base as Record<string, unknown>)[key];
+    // Deep-merge plain objects one level (footer, tools, heartbeat, etc.)
+    if (
+      value &&
+      typeof value === 'object' &&
+      !Array.isArray(value) &&
+      baseVal &&
+      typeof baseVal === 'object' &&
+      !Array.isArray(baseVal)
+    ) {
+      result[key] = { ...baseVal, ...value };
+    } else {
+      result[key] = value;
+    }
+  }
+  return result as FeishuConfig;
 }
 
 /** Coerce a domain string to `LarkBrand`, defaulting to `"feishu"`. */

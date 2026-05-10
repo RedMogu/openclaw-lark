@@ -36,18 +36,19 @@ import { getTicket } from '../core/lark-ticket';
 import { larkLogger } from '../core/lark-logger';
 
 const log = larkLogger('tools/auto-auth');
+import { formatLarkError } from '../core/api-error';
 import { getLarkAccount } from '../core/accounts';
-import { UserAuthRequiredError, UserScopeInsufficientError, AppScopeMissingError } from '../core/tool-client';
-import { invalidateAppScopeCache, getAppGrantedScopes, isAppScopeSatisfied } from '../core/app-scope-checker';
+import { AppScopeMissingError, UserAuthRequiredError, UserScopeInsufficientError } from '../core/tool-client';
+import { getAppGrantedScopes, invalidateAppScopeCache, isAppScopeSatisfied } from '../core/app-scope-checker';
 import { LarkClient } from '../core/lark-client';
 import { createCardEntity, sendCardByCardId, updateCardKitCardForAuth } from '../card/cardkit';
-import { executeAuthorize } from './oauth';
-import { formatLarkError, json } from './oapi/helpers';
-import { getResolvedConfig } from './helpers';
 import { OwnerAccessDeniedError } from '../core/owner-policy';
-import { enqueueFeishuChatTask } from '../channel/chat-queue';
-import { handleFeishuMessage } from '../messaging/inbound/handler';
-import { withTicket } from '../core/lark-ticket';
+import { dispatchSyntheticTextMessage } from '../messaging/inbound/synthetic-message';
+import { executeAuthorize } from './oauth';
+import { formatToolResult, getResolvedConfig } from './helpers';
+import type { ToolResult } from './helpers';
+
+const json = formatToolResult;
 
 // ---------------------------------------------------------------------------
 // Debounce + scope merge — 防抖缓冲区（两阶段）
@@ -681,7 +682,9 @@ async function sendAppScopeCard(params: {
       message:
         `应用缺少以下权限：${missingScopes.join(', ')}，` +
         `请管理员在开放平台开通后重试。` +
-        (appId ? `\n权限管理：${account.brand === 'lark' ? 'https://open.larksuite.com' : 'https://open.feishu.cn'}/app/${appId}/permission` : ''),
+        (appId
+          ? `\n权限管理：${account.brand === 'lark' ? 'https://open.larksuite.com' : 'https://open.feishu.cn'}/app/${appId}/permission`
+          : ''),
     });
   }
 
@@ -864,51 +867,22 @@ export async function handleCardAction(data: unknown, cfg: ClawdbotConfig, accou
         // 重试时工具会自然发现需要用户授权并发起正确的 OAuth 流程。
         log.info('no business scopes to authorize after app auth, sending synthetic message for retry');
         const syntheticMsgId = `${flow.ticket.messageId}:app-auth-complete`;
-        const syntheticEvent = {
-          sender: { sender_id: { open_id: flow.ticket.senderOpenId } },
-          message: {
-            message_id: syntheticMsgId,
-            chat_id: flow.ticket.chatId,
-            chat_type: flow.ticket.chatType ?? ('p2p' as const),
-            message_type: 'text',
-            content: JSON.stringify({ text: '应用权限已开通，请继续执行之前的操作。' }),
-            thread_id: flow.ticket.threadId,
-          },
-        };
         const syntheticRuntime = {
           log: (msg: string) => log.info(msg),
           error: (msg: string) => log.error(msg),
         };
-        const { promise } = enqueueFeishuChatTask({
+        await dispatchSyntheticTextMessage({
+          cfg: flow.cfg,
           accountId: flow.accountId,
           chatId: flow.ticket.chatId,
+          senderOpenId: flow.ticket.senderOpenId!,
+          text: '应用权限已开通，请继续执行之前的操作。',
+          syntheticMessageId: syntheticMsgId,
+          replyToMessageId: flow.ticket.messageId,
+          chatType: flow.ticket.chatType,
           threadId: flow.ticket.threadId,
-          task: async () => {
-            await withTicket(
-              {
-                messageId: syntheticMsgId,
-                chatId: flow.ticket.chatId,
-                accountId: flow.accountId,
-                startTime: Date.now(),
-                senderOpenId: flow.ticket.senderOpenId!,
-                chatType: flow.ticket.chatType,
-                threadId: flow.ticket.threadId,
-              },
-              () =>
-                handleFeishuMessage({
-                  cfg: flow.cfg,
-                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                  event: syntheticEvent as any,
-                  accountId: flow.accountId,
-                  forceMention: true,
-                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                  runtime: syntheticRuntime as any,
-                  replyToMessageId: flow.ticket.messageId,
-                }),
-            );
-          },
+          runtime: syntheticRuntime,
         });
-        await promise;
         log.info('synthetic message dispatched after app-auth-only completion');
       } else {
         await executeAuthorize({
@@ -954,7 +928,7 @@ export async function handleCardAction(data: unknown, cfg: ClawdbotConfig, accou
  * @param err - invoke() 或其他逻辑抛出的错误
  * @param cfg - OpenClaw 配置对象（从工具注册函数的闭包中获取）
  */
-export async function handleInvokeErrorWithAutoAuth(err: unknown, cfg: ClawdbotConfig) {
+export async function handleInvokeErrorWithAutoAuth(err: unknown, cfg: ClawdbotConfig): Promise<ToolResult> {
   // `cfg` is the closure-captured snapshot from plugin registration and may be
   // stale after a hot-reload.  Use getResolvedConfig() to always get the live config.
   cfg = getResolvedConfig(cfg);

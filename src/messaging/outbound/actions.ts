@@ -23,12 +23,12 @@ import { extractToolSend } from 'openclaw/plugin-sdk/tool-send';
 import { readStringParam } from 'openclaw/plugin-sdk/param-readers';
 import { jsonResult, readReactionParams } from '../../core/sdk-compat';
 
-import { addReactionFeishu, removeReactionFeishu, listReactionsFeishu } from './reactions';
-import { sendTextLark, sendCardLark } from './deliver';
-import { uploadAndSendMediaLark } from './media';
 import { LarkClient } from '../../core/lark-client';
 import { getEnabledLarkAccounts } from '../../core/accounts';
 import { larkLogger } from '../../core/lark-logger';
+import { addReactionFeishu, listReactionsFeishu, removeReactionFeishu } from './reactions';
+import { sendCardLark, sendTextLark } from './deliver';
+import { uploadAndSendMediaLark } from './media';
 
 const log = larkLogger('outbound/actions');
 
@@ -67,9 +67,11 @@ const SUPPORTED_ACTIONS: Set<ChannelMessageActionName> = new Set([
 function parseCardParam(raw: unknown): Record<string, unknown> | undefined {
   if (raw == null) return undefined;
 
-  // Already a non-array object — use directly.
+  // Already a non-array object — use directly (empty {} is never a valid card).
   if (typeof raw === 'object' && !Array.isArray(raw)) {
-    return raw as Record<string, unknown>;
+    const obj = raw as Record<string, unknown>;
+    if (Object.keys(obj).length === 0) return undefined;
+    return obj;
   }
 
   // String — attempt JSON.parse.
@@ -81,7 +83,7 @@ function parseCardParam(raw: unknown): Record<string, unknown> | undefined {
     }
     try {
       const parsed: unknown = JSON.parse(trimmed);
-      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+      if (typeof parsed === 'object' && parsed != null && !Array.isArray(parsed)) {
         log.info('params.card was a JSON string, parsed successfully');
         return parsed as Record<string, unknown>;
       }

@@ -14,131 +14,10 @@
 
 import type { LarkAccount } from '../../core/types';
 import { LarkClient } from '../../core/lark-client';
-import { extractPermissionError, type PermissionError } from './permission';
+import { getUserNameCache } from './user-name-cache-store';
+import { type PermissionError, extractPermissionError } from './permission';
 
-// ---------------------------------------------------------------------------
-// UserNameCache
-// ---------------------------------------------------------------------------
-
-const DEFAULT_MAX_SIZE = 500;
-const DEFAULT_TTL_MS = 30 * 60 * 1000; // 30 minutes
-
-interface CacheEntry {
-  name: string;
-  expireAt: number;
-}
-
-export class UserNameCache {
-  private map = new Map<string, CacheEntry>();
-  private maxSize: number;
-  private ttlMs: number;
-
-  constructor(maxSize = DEFAULT_MAX_SIZE, ttlMs = DEFAULT_TTL_MS) {
-    this.maxSize = maxSize;
-    this.ttlMs = ttlMs;
-  }
-
-  /** Check whether the cache holds a (possibly empty) entry for this openId. */
-  has(openId: string): boolean {
-    const entry = this.map.get(openId);
-    if (!entry) return false;
-    if (entry.expireAt <= Date.now()) {
-      this.map.delete(openId);
-      return false;
-    }
-    return true;
-  }
-
-  /** Get a cached name (refreshes LRU position). Returns `undefined` on miss or expiry. */
-  get(openId: string): string | undefined {
-    const entry = this.map.get(openId);
-    if (!entry) return undefined;
-    if (entry.expireAt <= Date.now()) {
-      this.map.delete(openId);
-      return undefined;
-    }
-    // LRU refresh: delete + re-insert to move to end
-    this.map.delete(openId);
-    this.map.set(openId, entry);
-    return entry.name;
-  }
-
-  /** Write a single entry (evicts oldest if over capacity). */
-  set(openId: string, name: string): void {
-    this.map.delete(openId); // ensure fresh insertion order
-    this.map.set(openId, { name, expireAt: Date.now() + this.ttlMs });
-    this.evict();
-  }
-
-  /** Write multiple entries at once. */
-  setMany(entries: Iterable<[string, string]>): void {
-    for (const [openId, name] of entries) {
-      this.map.delete(openId);
-      this.map.set(openId, { name, expireAt: Date.now() + this.ttlMs });
-    }
-    this.evict();
-  }
-
-  /** Return openIds that are NOT present (or expired) in the cache. */
-  filterMissing(openIds: string[]): string[] {
-    return openIds.filter((id) => !this.has(id));
-  }
-
-  /** Bulk read — returns a Map of openId→name for all hits (including empty-string names). */
-  getMany(openIds: string[]): Map<string, string> {
-    const result = new Map<string, string>();
-    for (const id of openIds) {
-      if (this.has(id)) {
-        result.set(id, this.get(id) ?? '');
-      }
-    }
-    return result;
-  }
-
-  /** Clear all entries. */
-  clear(): void {
-    this.map.clear();
-  }
-
-  private evict(): void {
-    while (this.map.size > this.maxSize) {
-      // Map iterator yields in insertion order — first key is the oldest
-      const oldest = this.map.keys().next().value;
-      if (oldest !== undefined) this.map.delete(oldest);
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Account-scoped singleton registry
-// ---------------------------------------------------------------------------
-
-const registry = new Map<string, UserNameCache>();
-
-/** Get (or create) the UserNameCache for a given account. */
-export function getUserNameCache(accountId: string): UserNameCache {
-  let c = registry.get(accountId);
-  if (!c) {
-    c = new UserNameCache();
-    registry.set(accountId, c);
-  }
-  return c;
-}
-
-/**
- * Clear user-name caches.
- * - With `accountId`: clear that single cache.
- * - Without: clear all caches.
- */
-export function clearUserNameCache(accountId?: string): void {
-  if (accountId !== undefined) {
-    registry.get(accountId)?.clear();
-    registry.delete(accountId);
-  } else {
-    for (const c of registry.values()) c.clear();
-    registry.clear();
-  }
-}
+export { UserNameCache, clearUserNameCache, getUserNameCache } from './user-name-cache-store';
 
 // ---------------------------------------------------------------------------
 // Batch resolve via contact/v3/users/batch
@@ -237,6 +116,57 @@ export function createBatchResolveNames(
 export interface ResolveUserNameResult {
   name?: string;
   permissionError?: PermissionError;
+}
+
+/**
+ * Resolve a single bot's display name via `/open-apis/bot/v3/bots/basic_batch`.
+ *
+ * Bots are not returned by the contact API, so they have their own endpoint.
+ * Names share the same account-scoped cache (keyed by openId) since both
+ * bots and users have `ou_` prefixed openIds and a single display name.
+ */
+export async function resolveBotName(params: {
+  account: LarkAccount;
+  openId: string;
+  log: (...args: unknown[]) => void;
+}): Promise<ResolveUserNameResult> {
+  const { account, openId, log } = params;
+  if (!account.configured || !openId) return {};
+
+  const cache = getUserNameCache(account.accountId);
+  if (cache.has(openId)) return { name: cache.get(openId) ?? '' };
+
+  try {
+    const client = LarkClient.fromAccount(account).sdk;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const res: any = await (client as any).request({
+      method: 'GET',
+      url: '/open-apis/bot/v3/bots/basic_batch',
+      params: { bot_ids: [openId] },
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const bot: any = res?.data?.bots?.[openId];
+    const name: string =
+      bot?.name || bot?.i18n_names?.zh_cn || bot?.i18n_names?.en_us || '';
+
+    // Cache even empty names to avoid repeated API calls for bots
+    // whose names we cannot resolve.
+    cache.set(openId, name);
+    return { name: name || undefined };
+  } catch (err) {
+    // Bot name resolution is best-effort: missing `bot:basic_info` scope
+    // should not surface as a permission notification to the agent. Log
+    // and cache an empty name so we don't retry, then fall back to openId.
+    const permErr = extractPermissionError(err);
+    if (permErr) {
+      log(`feishu: permission error resolving bot name (best-effort, ignored): code=${permErr.code}`);
+    } else {
+      log(`feishu: failed to resolve bot name for ${openId}: ${String(err)}`);
+    }
+    cache.set(openId, '');
+    return {};
+  }
 }
 
 /**

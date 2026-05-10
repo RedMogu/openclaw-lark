@@ -8,7 +8,10 @@ description: |
   (2) 需要创建、管理任务清单
   (3) 需要查看任务列表或清单内的任务
   (4) 用户提到"任务"、"待办"、"to-do"、"清单"、"task"
-  (5) 需要设置任务负责人、关注人、截止时间
+  (5) 需要设置任务负责人、关注人、截止时间、添加成员
+  (6) 需要追加任务步骤记录（Task 的 steps）
+  (7) 需要上传任务附件（支持 task / task_delivery）
+  (8) 需要注册 Agent / 更新 Agent 信息（register / update_profile）
 ---
 
 # 飞书任务管理
@@ -16,11 +19,14 @@ description: |
 ## 🚨 执行前必读
 
 - ✅ **时间格式**：ISO 8601 / RFC 3339（带时区），例如 `2026-02-28T17:00:00+08:00`
+- ✅ **身份授权**：工具支持 `auth_type` 为 `user`（默认，用户身份）或 `tenant`（应用身份）。
+- ✅ **任务 Agent（feishu_task_agent）**：仅支持应用身份（tenant），不支持 user 身份
 - ✅ **current_user_id 强烈建议**：从消息上下文的 SenderId 获取（ou_...），工具会自动添加为 follower（如不在 members 中），确保创建者可以编辑任务
 - ✅ **patch/get 必须**：task_guid
 - ✅ **tasklist.tasks 必须**：tasklist_guid
 - ✅ **完成任务**：completed_at = "2026-02-26 15:00:00"
 - ✅ **反完成（恢复未完成）**：completed_at = "0"
+- ✅ **append_steps 的 task_steps[].timestamp**：秒级 Unix 时间戳（10 位），不要用毫秒（13 位）
 
 ---
 
@@ -28,52 +34,58 @@ description: |
 
 | 用户意图 | 工具 | action | 必填参数 | 强烈建议 | 常用可选 |
 |---------|------|--------|---------|---------|---------|
-| 新建待办 | feishu_task_task | create | summary | current_user_id（SenderId） | members, due, description |
-| 查未完成任务 | feishu_task_task | list | - | completed=false | page_size |
-| 获取任务详情 | feishu_task_task | get | task_guid | - | - |
-| 完成任务 | feishu_task_task | patch | task_guid, completed_at | - | - |
-| 反完成任务 | feishu_task_task | patch | task_guid, completed_at="0" | - | - |
-| 改截止时间 | feishu_task_task | patch | task_guid, due | - | - |
+| 新建待办 | feishu_task_task | create | summary | current_user_id（SenderId） | members, due, description, auth_type |
+| 查未完成任务 | feishu_task_task | list | - | completed=false | page_size, auth_type, agent_task_status |
+| 获取任务详情 | feishu_task_task | get | task_guid | - | auth_type |
+| 完成任务 | feishu_task_task | patch | task_guid, completed_at | - | auth_type |
+| 反完成任务 | feishu_task_task | patch | task_guid, completed_at="0" | - | auth_type |
+| 改截止时间 | feishu_task_task | patch | task_guid, due | - | auth_type |
+| 添加任务成员 | feishu_task_task | add_members | task_guid, members[] | - | auth_type |
+| 追加任务步骤记录 | feishu_task_task | append_steps | task_guid, idempotent_key, task_steps[] | task_steps[].timestamp 用秒级（10 位） | - |
 | 创建清单 | feishu_task_tasklist | create | name | - | members |
 | 查看清单任务 | feishu_task_tasklist | tasks | tasklist_guid | - | completed |
 | 添加清单成员 | feishu_task_tasklist | add_members | tasklist_guid, members[] | - | - |
+| 上传任务附件 | feishu_task_attachment | upload | resource_id, file(base64) | name | resource_type |
+| 注册任务 Agent | feishu_task_agent | register | - | 仅支持 tenant（应用身份） | - |
+| 更新任务 Agent Profile | feishu_task_agent | update_profile | profile_content | 仅支持 tenant（应用身份） | - |
 
 ---
 
 ## 🎯 核心约束（Schema 未透露的知识）
 
-### 1. 当前工具使用用户身份（已内置保护）
+### 1. 授权身份与可见性 (auth_type)
 
-**工具使用 `user_access_token`（用户身份）**
-
-这意味着：
-- ✅ 创建任务时可以指定任意成员（包括只分配给别人）
-- ⚠️ 只能查看和编辑**自己是成员的任务**
-- ⚠️ **如果创建时没把自己加入成员，后续无法编辑该任务**
+**工具支持两种调用身份 `auth_type`**：
+- **`user` (默认)**：用户身份（user_access_token）。用于需要严格代表用户操作或查询用户私有任务的场景。
+  - ⚠️ 使用 `user` 身份时，只能查看和编辑**自己是成员的任务**。
+  - ⚠️ **如果创建时没把自己加入成员，后续无法编辑该任务**。
+- **`tenant`**：应用身份（tenant_access_token）。当用户身份不满足要求时，使用应用身份。如果创建的任务没有把用户加入成员，用户可能看不见。
 
 **自动保护机制**：
 - 传入 `current_user_id` 参数（从 SenderId 获取）
 - 如果 `members` 中不包含 `current_user_id`，工具会**自动添加为 follower**
-- 确保创建者始终可以编辑任务
+- 确保创建者始终可以编辑和查看任务
 
-**推荐用法**：创建任务时始终传 `current_user_id`，工具会自动处理成员关系。
+### 2. 任务成员的角色与类型
 
-### 2. 任务成员的角色说明
-
-- **assignee（负责人）**：负责完成任务，可以编辑任务
-- **follower（关注人）**：关注任务进展，接收通知
+- **角色 (role)**：
+  - **assignee（负责人）**：负责完成任务，可以编辑任务
+  - **follower（关注人）**：关注任务进展，接收通知
+- **类型 (type)**：
+  - **user（默认，用户）**：普通的飞书用户
+  - **app（应用/机器人）**：如果是把机器人自己或者其他应用加入任务，必须指定 `type: "app"`
 
 **添加成员示例**：
 ```json
 {
   "members": [
-    {"id": "ou_xxx", "role": "assignee"},  // 负责人
-    {"id": "ou_yyy", "role": "follower"}   // 关注人
+    {"id": "ou_xxx", "role": "assignee", "type": "user"},  // 负责人（用户）
+    {"id": "cli_yyy", "role": "follower", "type": "app"}   // 关注人（机器人/应用）
   ]
 }
 ```
 
-**说明**：`id` 使用用户的 `open_id`（从消息上下文的 SenderId 获取）
+**说明**：`id` 默认使用 `open_id`。
 
 ### 3. 任务清单角色冲突
 
@@ -133,12 +145,13 @@ description: |
   "summary": "准备周会材料",
   "description": "整理本周工作进展和下周计划",
   "current_user_id": "ou_发送者的open_id",
+  "auth_type": "tenant",
   "due": {
     "timestamp": "2026-02-28 17:00:00",
     "is_all_day": false
   },
   "members": [
-    {"id": "ou_协作者的open_id", "role": "assignee"}
+    {"id": "ou_协作者的open_id", "role": "assignee", "type": "user"}
   ]
 }
 ```
@@ -147,7 +160,7 @@ description: |
 - `summary` 是必填字段
 - `current_user_id` 强烈建议传入（从 SenderId 获取），工具会自动添加为 follower
 - `members` 可以只包含其他协作者，当前用户会被自动添加
-- 时间使用北京时间字符串格式
+- 时间使用带时区的 ISO 8601 格式
 
 ### 场景 2: 查询我负责的未完成任务
 
@@ -155,11 +168,25 @@ description: |
 {
   "action": "list",
   "completed": false,
-  "page_size": 20
+  "page_size": 20,
+  "auth_type": "user"
 }
 ```
 
-### 场景 3: 完成任务
+### 场景 3: 为现有任务添加机器人或成员
+
+```json
+{
+  "action": "add_members",
+  "task_guid": "任务的guid",
+  "auth_type": "tenant",
+  "members": [
+    {"id": "cli_机器人的app_id", "role": "follower", "type": "app"}
+  ]
+}
+```
+
+### 场景 4: 完成任务
 
 ```json
 {
@@ -169,7 +196,7 @@ description: |
 }
 ```
 
-### 场景 4: 反完成任务（恢复未完成状态）
+### 场景 5: 反完成任务（恢复未完成状态）
 
 ```json
 {
@@ -179,7 +206,7 @@ description: |
 }
 ```
 
-### 场景 5: 创建清单并添加协作者
+### 场景 6: 创建清单并添加协作者
 
 ```json
 {
@@ -192,7 +219,7 @@ description: |
 }
 ```
 
-### 场景 6: 查看清单内的未完成任务
+### 场景 7: 查看清单内的未完成任务
 
 ```json
 {
@@ -202,7 +229,7 @@ description: |
 }
 ```
 
-### 场景 7: 全天任务
+### 场景 8: 全天任务
 
 ```json
 {
@@ -215,6 +242,25 @@ description: |
 }
 ```
 
+### 场景 9: 注册任务 Agent（仅应用身份）
+
+```json
+{
+  "action": "register",
+  "auth_type": "tenant"
+}
+```
+
+### 场景 10: 更新任务 Agent Profile（仅应用身份）
+
+```json
+{
+  "action": "update_profile",
+  "auth_type": "tenant",
+  "profile_content": "some profile content"
+}
+```
+
 ---
 
 ## 🔍 常见错误与排查
@@ -222,10 +268,11 @@ description: |
 | 错误现象 | 根本原因 | 解决方案 |
 |---------|---------|---------|
 | **创建后无法编辑任务** | 创建时未将自己加入 members | 创建时至少将当前用户（SenderId）加为 assignee 或 follower |
-| **patch 失败提示 task_guid 缺失** | 未传 task_guid 参数 | patch/get 必须传 task_guid |
+| **patch 失败提示 task_guid 缺失** | 未传 task_guid 参数 | patch/get/add_members 必须传 task_guid |
 | **tasks 失败提示 tasklist_guid 缺失** | 未传 tasklist_guid 参数 | tasklist.tasks action 必须传 tasklist_guid |
 | **反完成失败** | completed_at 格式错误 | 使用 `"0"` 字符串，不是数字 0 |
 | **时间不对** | 使用了 Unix 时间戳 | 改用 ISO 8601 格式（带时区）：`2024-01-01T00:00:00+08:00` |
+| **添加机器人失败** | 未指定成员 type 为 app | 将机器人的 type 指定为 `"app"` |
 
 ---
 

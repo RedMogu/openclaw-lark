@@ -154,7 +154,7 @@ export function findMarkdownTablesOutsideCodeBlocks(text: string): MarkdownTable
   const codeBlockRanges: Array<{ start: number; end: number }> = [];
   const codeBlockRegex = /```[\s\S]*?```/g;
   let codeBlockMatch = codeBlockRegex.exec(text);
-  while (codeBlockMatch !== null) {
+  while (codeBlockMatch != null) {
     codeBlockRanges.push({
       start: codeBlockMatch.index,
       end: codeBlockMatch.index + codeBlockMatch[0].length,
@@ -162,12 +162,13 @@ export function findMarkdownTablesOutsideCodeBlocks(text: string): MarkdownTable
     codeBlockMatch = codeBlockRegex.exec(text);
   }
 
-  const isInsideCodeBlock = (idx: number): boolean => codeBlockRanges.some((range) => idx >= range.start && idx < range.end);
+  const isInsideCodeBlock = (idx: number): boolean =>
+    codeBlockRanges.some((range) => idx >= range.start && idx < range.end);
 
   const tableRegex = /\|.+\|[\r\n]+\|[-:| ]+\|[\s\S]*?(?=\n\n|\n(?!\|)|$)/g;
   const matches: MarkdownTableMatch[] = [];
   let tableMatch = tableRegex.exec(text);
-  while (tableMatch !== null) {
+  while (tableMatch != null) {
     if (!isInsideCodeBlock(tableMatch.index)) {
       matches.push({
         index: tableMatch.index,

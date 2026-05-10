@@ -61,6 +61,71 @@ export interface FeishuReactionCreatedEvent {
   action_time?: string;
 }
 
+/**
+ * Raw event shape for `drive.notice.comment_add_v1`.
+ *
+ * Fired when a user adds a comment or reply on a Drive document.
+ * The SDK flattens the v2 envelope header into the handler `data` object,
+ * so `app_id` is available directly on the event.
+ *
+ * **Real event structure** (SDK-flattened):
+ * ```json
+ * {
+ *   "app_id": "cli_xxx",
+ *   "file_token": "xxx",
+ *   "file_type": "docx",
+ *   "comment_id": "xxx",
+ *   "reply_id": "xxx",          // optional, present for replies
+ *   "notice_meta": {
+ *     "from_user_id": { "open_id": "ou_xxx", "user_id": "xxx", "union_id": "xxx" },
+ *     "timestamp": "1712000000000",
+ *     "is_mentioned": true
+ *   }
+ * }
+ * ```
+ *
+ * Some fields may also appear at top-level depending on SDK version,
+ * so the parser checks both locations.
+ */
+export interface FeishuDriveCommentEvent {
+  /** App ID from the event envelope header. */
+  app_id?: string;
+  /** File token of the document where the comment was added. */
+  file_token?: string;
+  /** File type: doc, docx, sheet, file, slides, etc. */
+  file_type?: string;
+  /** Comment ID of the root comment. */
+  comment_id?: string;
+  /** Reply ID (present when the event is a reply, not a root comment). */
+  reply_id?: string;
+  /**
+   * Metadata about the notice — primary location for user info and timestamp.
+   * Present in the real event structure; not always at top level.
+   */
+  notice_meta?: {
+    from_user_id?: {
+      open_id?: string;
+      user_id?: string;
+      union_id?: string;
+    };
+    file_token?: string;
+    file_type?: string;
+    timestamp?: string;
+    is_mentioned?: boolean;
+  };
+  // --- Fallback top-level fields (legacy / some SDK versions) ---
+  /** Whether the bot was @-mentioned in this comment. */
+  is_mention?: boolean;
+  /** Fallback: user ID at top level (some SDK flattening styles). */
+  user_id?: {
+    open_id?: string;
+    user_id?: string;
+    union_id?: string;
+  };
+  /** Fallback: event timestamp at top level. */
+  action_time?: string;
+}
+
 export interface FeishuBotAddedEvent {
   chat_id: string;
   operator_id: {
@@ -76,6 +141,59 @@ export interface FeishuBotAddedEvent {
     en_us?: string;
     ja_jp?: string;
   };
+}
+
+/**
+ * Raw event shape for `vc.bot.meeting_invited_v1`.
+ *
+ * Fired when a user invites the bot to join a meeting.
+ *
+ * Identity fields (for bot / inviter / host_user) are nested under an
+ * `id` object; individual id variants (open_id / user_id / union_id)
+ * may be null depending on the tenant configuration.
+ */
+export interface FeishuVcMeetingInvitedEvent {
+  app_id?: string;
+  event_id?: string;
+  meeting?: {
+    id?: string;
+    meeting_no?: string;
+    topic?: string;
+    host_user?: {
+      id?: { open_id?: string | null; user_id?: string | null; union_id?: string | null };
+      user_name?: string;
+    };
+  };
+  bot?: {
+    id?: { open_id?: string | null; user_id?: string | null; union_id?: string | null };
+    user_name?: string;
+  };
+  inviter?: {
+    id?: { open_id?: string | null; user_id?: string | null; union_id?: string | null };
+    user_name?: string;
+  };
+  invite_time?: string;
+}
+
+/**
+ * Internal synthetic event model for VC meeting-invited flows.
+ *
+ * This preserves the business semantics before the event is converted into a
+ * synthetic MessageContext for dispatchToAgent().
+ */
+export interface VcMeetingInvitedSyntheticEvent {
+  eventType: 'vc.bot.meeting_invited_v1';
+  source: 'feishu-vc-event';
+  eventId?: string;
+  meetingId?: string;
+  meetingNo: string;
+  topic?: string;
+  senderId: string;
+  senderOpenId?: string;
+  senderUserId?: string;
+  senderUnionId?: string;
+  senderName?: string;
+  inviteTime?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -168,6 +286,16 @@ export interface MessageContext {
   resources: ResourceDescriptor[];
   /** All @mentions in the message (including bot). */
   mentions: MentionInfo[];
+  /** Whether an @all / @所有人 mention was detected in the message. */
+  mentionAll: boolean;
+  /**
+   * True when the event sender is a bot/app (sender_type === 'app').
+   *
+   * Set by parseMessageEvent. Optional because synthetic construction sites
+   * (comment / reaction / vc-invited handlers) omit it — absence is treated
+   * as `false` since those paths only originate from human actors today.
+   */
+  senderIsBot?: boolean;
 
   // Message relationships
   rootId?: string;

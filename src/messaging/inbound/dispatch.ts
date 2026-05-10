@@ -14,40 +14,44 @@
  * - dispatch-commands.ts — system command & permission notification
  */
 
-import type { RuntimeEnv } from 'openclaw/plugin-sdk';
+import type { ClawdbotConfig, RuntimeEnv  } from 'openclaw/plugin-sdk';
 import type { HistoryEntry } from 'openclaw/plugin-sdk/reply-history';
 import { clearHistoryEntriesIfEnabled } from 'openclaw/plugin-sdk/reply-history';
 import type { MessageContext } from '../types';
-import type { LarkAccount } from '../../core/types';
-import type { FeishuGroupConfig } from '../../core/types';
-import type { PermissionError } from './permission';
+import type { FeishuGroupConfig, LarkAccount  } from '../../core/types';
 import { larkLogger } from '../../core/lark-logger';
 import { ticketElapsed } from '../../core/lark-ticket';
 import { createFeishuReplyDispatcher } from '../../card/reply-dispatcher';
-import { mentionedBot } from './mention';
 import {
   buildQueueKey,
-  threadScopedKey,
   registerActiveDispatcher,
+  threadScopedKey,
   unregisterActiveDispatcher,
 } from '../../channel/chat-queue';
+import { resolveToolUseDisplayConfig } from '../../card/tool-use-config';
+import { clearToolUseTraceRun, startToolUseTraceRun } from '../../card/tool-use-trace-store';
 import { isLikelyAbortText } from '../../channel/abort-detect';
-import { type DispatchContext, buildDispatchContext, resolveThreadSessionKey } from './dispatch-context';
 import { isThreadCapableGroup } from '../../core/chat-info-cache';
-import {
-  buildMessageBody,
-  buildBodyForAgent,
-  buildInboundPayload,
-  buildEnvelopeWithHistory,
-} from './dispatch-builders';
-import { dispatchPermissionNotification, dispatchSystemCommand } from './dispatch-commands';
+import { isCommentTarget } from '../../core/comment-target';
+import { SYNTHETIC_VC_CHAT_ID, isSyntheticTarget } from '../../core/synthetic-target';
 import { encodeFeishuRouteTarget } from '../../core/targets';
-import type { ClawdbotConfig } from 'openclaw/plugin-sdk';
-import { LarkClient } from '../../core/lark-client';
+import type { LarkClient } from '../../core/lark-client';
+import { sendCommentReplyLark } from '../outbound/deliver';
 import { runFeishuDoctorI18n } from '../../commands/doctor';
 import { runFeishuAuthI18n } from '../../commands/auth';
-import { runFeishuStartI18n, getFeishuHelpI18n } from '../../commands/index';
-import { sendCardFeishu, buildI18nMarkdownCard, sendMessageFeishu } from '../outbound/send';
+import { getFeishuHelpI18n, runFeishuStartI18n } from '../../commands/index';
+import { buildI18nMarkdownCard, sendCardFeishu, sendMessageFeishu } from '../outbound/send';
+import { dispatchPermissionNotification, dispatchSystemCommand } from './dispatch-commands';
+import {
+  buildBodyForAgent,
+  buildEnvelopeWithHistory,
+  buildInboundPayload,
+  buildMessageBody,
+} from './dispatch-builders';
+import { type DispatchContext, buildDispatchContext, resolveThreadSessionKey } from './dispatch-context';
+import type { PermissionError } from './permission';
+import { mentionedBot } from './mention';
+import { resolveRespondToMentionAll } from './gate';
 
 const log = larkLogger('inbound/dispatch');
 
@@ -63,6 +67,140 @@ const log = larkLogger('inbound/dispatch');
  * system-command path — command handlers don't consume history context,
  * so the entries should be preserved for the next normal message.
  */
+/**
+ * Dispatch a comment-target message via the buffered block dispatcher.
+ *
+ * Comment targets cannot use the streaming card flow (IM APIs don't
+ * understand comment:... targets). Instead we use the SDK's buffered
+ * block dispatcher with a deliver callback that sends via the Drive
+ * comment reply API.
+ */
+async function dispatchCommentMessage(
+  dc: DispatchContext,
+  ctxPayload: ReturnType<typeof LarkClient.runtime.channel.reply.finalizeInboundContext>,
+  skillFilter?: string[],
+): Promise<void> {
+  const effectiveSessionKey = dc.threadSessionKey ?? dc.route.sessionKey;
+  dc.log(`feishu[${dc.account.accountId}]: dispatching comment reply (session=${effectiveSessionKey})`);
+  log.info(`dispatching comment reply (session=${effectiveSessionKey})`);
+
+  let delivered = false;
+
+  await dc.core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+    ctx: ctxPayload,
+    cfg: dc.accountScopedCfg,
+    dispatcherOptions: {
+      deliver: async (payload) => {
+        const text = payload.text?.trim() ?? '';
+        if (!text || text === 'NO_REPLY') return;
+        await sendCommentReplyLark({
+          cfg: dc.accountScopedCfg,
+          to: dc.ctx.chatId,
+          text,
+          accountId: dc.account.accountId,
+        });
+        delivered = true;
+      },
+      onSkip: (_payload, info) => {
+        if (info.reason !== 'silent') {
+          dc.log(`feishu[${dc.account.accountId}]: comment reply skipped (reason=${info.reason})`);
+        }
+      },
+      onError: (err, info) => {
+        dc.error(`feishu[${dc.account.accountId}]: comment ${info.kind} reply failed: ${String(err)}`);
+      },
+    },
+    replyOptions: {
+      ...(skillFilter ? { skillFilter } : {}),
+    },
+  });
+
+  dc.log(`feishu[${dc.account.accountId}]: comment dispatch complete (delivered=${delivered})`);
+  log.info(`comment dispatch complete (delivered=${delivered}, elapsed=${ticketElapsed()}ms)`);
+}
+
+/**
+ * Dispatch a synthetic-target message via the buffered block dispatcher
+ * while discarding every delivered payload.
+ *
+ * Synthetic contexts (e.g. VC meeting-invited) trigger the agent for its
+ * side-effects (tool calls) — they do not correspond to a real IM chat,
+ * so any text / card the agent emits must be dropped instead of being
+ * sent as a DM to whatever open_id happens to be in ctx.chatId.
+ */
+async function dispatchSyntheticMessage(
+  dc: DispatchContext,
+  ctxPayload: ReturnType<typeof LarkClient.runtime.channel.reply.finalizeInboundContext>,
+  skillFilter?: string[],
+): Promise<void> {
+  const effectiveSessionKey = dc.threadSessionKey ?? dc.route.sessionKey;
+  const isVcSynthetic = dc.ctx.chatId === SYNTHETIC_VC_CHAT_ID;
+  let deliveredFinalToSender = false;
+  dc.log(
+    `feishu[${dc.account.accountId}]: dispatching synthetic reply (session=${effectiveSessionKey}, target=${dc.ctx.chatId})`,
+  );
+  log.info(`dispatching synthetic reply (session=${effectiveSessionKey})`);
+
+  await dc.core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+    ctx: ctxPayload,
+    cfg: dc.accountScopedCfg,
+    dispatcherOptions: {
+      deliver: async (payload, info) => {
+        const text = payload.text?.trim() ?? '';
+        const preview = text.slice(0, 120);
+
+        // VC invited flows intentionally keep the synthetic target to avoid
+        // leaking intermediate tool output to IM, but the final business
+        // result should be explicitly notified to the inviter.
+        //
+        // Important: this DM is only a transport bridge for the final text.
+        // It does not rebind the inviter's DM conversation to the synthetic
+        // meeting-scoped session; later DM replies will still be routed by the
+        // normal OpenClaw DM session rules.
+        if (isVcSynthetic && info.kind === 'final' && text && text !== 'NO_REPLY' && !deliveredFinalToSender) {
+          deliveredFinalToSender = true;
+          try {
+            await sendMessageFeishu({
+              cfg: dc.accountScopedCfg,
+              to: dc.ctx.senderId,
+              text,
+              accountId: dc.account.accountId,
+            });
+            dc.log(
+              `feishu[${dc.account.accountId}]: synthetic VC final delivered explicitly to sender=${dc.ctx.senderId}, preview="${preview}"`,
+            );
+            return;
+          } catch (err) {
+            deliveredFinalToSender = false;
+            dc.error(
+              `feishu[${dc.account.accountId}]: synthetic VC final delivery failed to sender=${dc.ctx.senderId}: ${String(err)}`,
+            );
+          }
+        }
+
+        if (info.kind === 'final') {
+          dc.log(
+            `feishu[${dc.account.accountId}]: synthetic final payload dropped (target=${dc.ctx.chatId})`,
+          );
+        }
+      },
+      onSkip: (_payload, info) => {
+        if (info.reason !== 'silent') {
+          dc.log(`feishu[${dc.account.accountId}]: synthetic reply skipped (reason=${info.reason})`);
+        }
+      },
+      onError: (err, info) => {
+        dc.error(`feishu[${dc.account.accountId}]: synthetic ${info.kind} reply failed: ${String(err)}`);
+      },
+    },
+    replyOptions: {
+      ...(skillFilter ? { skillFilter } : {}),
+    },
+  });
+
+  dc.log(`feishu[${dc.account.accountId}]: synthetic dispatch complete (elapsed=${ticketElapsed()}ms)`);
+}
+
 async function dispatchNormalMessage(
   dc: DispatchContext,
   ctxPayload: ReturnType<typeof LarkClient.runtime.channel.reply.finalizeInboundContext>,
@@ -73,26 +211,57 @@ async function dispatchNormalMessage(
   skillFilter?: string[],
   skipTyping?: boolean,
 ): Promise<void> {
+  // Synthetic targets (e.g. VC meeting-invited) have no real IM peer to
+  // deliver replies to. Route them through the buffered block dispatcher
+  // with a deliver() that drops every payload — the agent still runs
+  // (tool calls, side-effects) but produces no outbound IM traffic.
+  if (isSyntheticTarget(dc.ctx.chatId)) {
+    await dispatchSyntheticMessage(dc, ctxPayload, skillFilter);
+    return;
+  }
+
+  // Comment targets bypass the streaming card / IM flow entirely —
+  // route through the Drive comment reply API.
+  if (isCommentTarget(dc.ctx.chatId)) {
+    await dispatchCommentMessage(dc, ctxPayload, skillFilter);
+    return;
+  }
+
   // Abort messages should never create streaming cards — dispatch via the
   // plain-text system-command path so the SDK's abort handler can reply
   // without touching CardKit.
   if (isLikelyAbortText(dc.ctx.content?.trim() ?? '')) {
     dc.log(`feishu[${dc.account.accountId}]: abort message detected, using plain-text dispatch`);
     log.info('abort message detected, using plain-text dispatch');
-    await dispatchSystemCommand(dc, ctxPayload, false, replyToMessageId);
+    await dispatchSystemCommand(dc, ctxPayload, replyToMessageId);
     return;
+  }
+
+  const effectiveSessionKey = dc.threadSessionKey ?? dc.route.sessionKey;
+  const toolUseDisplay = resolveToolUseDisplayConfig({
+    cfg: dc.accountScopedCfg,
+    feishuCfg: dc.account.config,
+    agentId: dc.route.agentId,
+    sessionKey: effectiveSessionKey,
+    body: dc.ctx.content,
+  });
+  if (toolUseDisplay.showToolUse) {
+    startToolUseTraceRun(effectiveSessionKey);
+  } else {
+    clearToolUseTraceRun(effectiveSessionKey);
   }
 
   const { dispatcher, replyOptions, markDispatchIdle, markFullyComplete, abortCard } = createFeishuReplyDispatcher({
     cfg: dc.accountScopedCfg,
     agentId: dc.route.agentId,
-    sessionKey: dc.threadSessionKey ?? dc.route.sessionKey,
     chatId: dc.ctx.chatId,
+    sessionKey: effectiveSessionKey,
     replyToMessageId: replyToMessageId ?? dc.ctx.messageId,
     accountId: dc.account.accountId,
     chatType: dc.ctx.chatType,
     skipTyping,
     replyInThread: dc.isThread,
+    toolUseDisplay,
   });
 
   // Create an AbortController so the abort fast-path can cancel the
@@ -104,7 +273,6 @@ async function dispatchNormalMessage(
   const queueKey = buildQueueKey(dc.account.accountId, dc.ctx.chatId, dc.ctx.threadId);
   registerActiveDispatcher(queueKey, { abortCard, abortController });
 
-  const effectiveSessionKey = dc.threadSessionKey ?? dc.route.sessionKey;
   dc.log(`feishu[${dc.account.accountId}]: dispatching to agent (session=${effectiveSessionKey})`);
   log.info(`dispatching to agent (session=${effectiveSessionKey})`);
 
@@ -155,6 +323,8 @@ export async function dispatchToAgent(params: {
   ctx: MessageContext;
   permissionError?: PermissionError;
   mediaPayload: Record<string, unknown>;
+  /** Additional structured metadata for synthetic or event-driven inbound flows. */
+  extraInboundFields?: Record<string, unknown>;
   quotedContent?: string;
   account: LarkAccount;
   /** account 级别的 ClawdbotConfig（channels.feishu 已替换为 per-account 合并后的配置） */
@@ -214,7 +384,10 @@ export async function dispatchToAgent(params: {
 
   // 3. Permission-error notification (optional side-effect).
   //    Isolated so a failure here does not block the main message dispatch.
-  if (params.permissionError) {
+  //    Skipped for comment targets: the streaming card dispatcher inside
+  //    dispatchPermissionNotification sends via IM APIs which don't
+  //    understand comment:... targets.
+  if (params.permissionError && !isCommentTarget(dc.ctx.chatId)) {
     try {
       await dispatchPermissionNotification(dc, params.permissionError, params.replyToMessageId);
     } catch (err) {
@@ -270,11 +443,19 @@ export async function dispatchToAgent(params: {
     senderName: params.ctx.senderName ?? params.ctx.senderId,
     senderId: params.ctx.senderId,
     messageSid: params.ctx.messageId,
-    wasMentioned: mentionedBot(params.ctx),
+    wasMentioned:
+      mentionedBot(params.ctx) ||
+      (params.ctx.mentionAll &&
+        resolveRespondToMentionAll({
+          groupConfig: params.groupConfig,
+          defaultConfig: params.defaultGroupConfig,
+          accountFeishuCfg: params.account.config,
+        })),
     replyToBody: params.quotedContent,
     inboundHistory,
     extraFields: {
       ...params.mediaPayload,
+      ...(params.extraInboundFields ?? {}),
       ...(groupSystemPrompt ? { GroupSystemPrompt: groupSystemPrompt } : {}),
       ...(dc.ctx.threadId ? { MessageThreadId: dc.ctx.threadId } : {}),
     },
@@ -284,11 +465,15 @@ export async function dispatchToAgent(params: {
   //     Must run BEFORE the SDK command check — the SDK does not recognise
   //     plugin-registered commands via isControlCommandMessage, so
   //     /feishu_* falls through to the AI agent otherwise.
+  //     Skipped for comment targets: comment text won't match /feishu_*
+  //     patterns in practice, and sendCardFeishu/sendMessageFeishu can't
+  //     deliver to comment:... targets.
   const contentTrimmed = (params.ctx.content ?? '').trim();
-  const isDoctorCommand = /^\/feishu[_ ]doctor\s*$/i.test(contentTrimmed);
-  const isAuthCommand = /^\/feishu[_ ](?:auth|onboarding)\s*$/i.test(contentTrimmed);
-  const isStartCommand = /^\/feishu[_ ]start\s*$/i.test(contentTrimmed);
-  const isHelpCommand = /^\/feishu(?:[_ ]help)?\s*$/i.test(contentTrimmed);
+  const isCommentFlow = isCommentTarget(dc.ctx.chatId);
+  const isDoctorCommand = !isCommentFlow && /^\/feishu[_ ]doctor\s*$/i.test(contentTrimmed);
+  const isAuthCommand = !isCommentFlow && /^\/feishu[_ ](?:auth|onboarding)\s*$/i.test(contentTrimmed);
+  const isStartCommand = !isCommentFlow && /^\/feishu[_ ]start\s*$/i.test(contentTrimmed);
+  const isHelpCommand = !isCommentFlow && /^\/feishu(?:[_ ]help)?\s*$/i.test(contentTrimmed);
 
   const i18nCommandName = isDoctorCommand
     ? 'doctor'
@@ -339,13 +524,16 @@ export async function dispatchToAgent(params: {
   }
 
   // 8. Dispatch: system command vs. normal message
-  const isCommand = dc.core.channel.commands.isControlCommandMessage(params.ctx.content, params.accountScopedCfg);
+  //    Comment targets always go to normal dispatch — system command
+  //    delivery uses sendMessageFeishu which can't reach comment threads.
+  const isCommand = !isCommentFlow &&
+    dc.core.channel.commands.isControlCommandMessage(params.ctx.content, params.accountScopedCfg);
 
   // Resolve per-group skill filter (per-group > default "*")
   const skillFilter = dc.isGroup ? (params.groupConfig?.skills ?? params.defaultGroupConfig?.skills) : undefined;
 
   if (isCommand) {
-    await dispatchSystemCommand(dc, ctxPayload, false, params.replyToMessageId);
+    await dispatchSystemCommand(dc, ctxPayload, params.replyToMessageId);
     // /new and /reset explicitly start a new session — clear pending history
     if (isBareNewOrReset && dc.isGroup && historyKey && params.chatHistories) {
       clearHistoryEntriesIfEnabled({

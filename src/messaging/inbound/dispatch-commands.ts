@@ -8,13 +8,14 @@
  * and permission-error notifications via the streaming card flow.
  */
 
-import type { DispatchContext } from './dispatch-context';
-import type { PermissionError } from './permission';
-import { LarkClient } from '../../core/lark-client';
+import type { LarkClient } from '../../core/lark-client';
 import { larkLogger } from '../../core/lark-logger';
 import { ticketElapsed } from '../../core/lark-ticket';
 import { createFeishuReplyDispatcher } from '../../card/reply-dispatcher';
+import { startToolUseTraceRun } from '../../card/tool-use-trace-store';
 import { sendMessageFeishu } from '../outbound/send';
+import type { PermissionError } from './permission';
+import type { DispatchContext } from './dispatch-context';
 import { buildInboundPayload } from './dispatch-builders';
 
 const log = larkLogger('inbound/dispatch-commands');
@@ -54,6 +55,8 @@ export async function dispatchPermissionNotification(
     wasMentioned: false,
   });
 
+  startToolUseTraceRun(dc.threadSessionKey ?? dc.route.sessionKey);
+
   const {
     dispatcher: permDispatcher,
     replyOptions: permReplyOptions,
@@ -62,12 +65,18 @@ export async function dispatchPermissionNotification(
   } = createFeishuReplyDispatcher({
     cfg: dc.accountScopedCfg,
     agentId: dc.route.agentId,
-    sessionKey: dc.threadSessionKey ?? dc.route.sessionKey,
     chatId: dc.ctx.chatId,
+    sessionKey: dc.threadSessionKey ?? dc.route.sessionKey,
     replyToMessageId: replyToMessageId ?? dc.ctx.messageId,
     accountId: dc.account.accountId,
     chatType: dc.ctx.chatType,
     replyInThread: dc.isThread,
+    toolUseDisplay: {
+      mode: 'off',
+      showToolUse: false,
+      showToolResultDetails: false,
+      showFullPaths: false,
+    },
   });
 
   dc.log(`feishu[${dc.account.accountId}]: dispatching permission error notification to agent`);
@@ -91,31 +100,29 @@ export async function dispatchPermissionNotification(
 /**
  * Dispatch a system command (/help, /reset, etc.) via plain-text delivery.
  * No streaming card, no "Processing..." state.
- *
- * When `suppressReply` is true the agent still runs (e.g. reads workspace
- * files) but its text output is not forwarded to Feishu.  This is used for
- * bare /new and /reset commands: the SDK already sends a "done" notice
- * via its own route, so the AI greeting would be redundant.
  */
 export async function dispatchSystemCommand(
   dc: DispatchContext,
   ctxPayload: ReturnType<typeof LarkClient.runtime.channel.reply.finalizeInboundContext>,
-  suppressReply = false,
   replyToMessageId?: string,
 ): Promise<void> {
   let delivered = false;
+  const suppressToolDetails = isLifecycleSessionCommand(dc.ctx.content);
 
   dc.log(
-    `feishu[${dc.account.accountId}]: detected system command, using plain-text dispatch${suppressReply ? ' (reply suppressed)' : ''}`,
+    `feishu[${dc.account.accountId}]: detected system command, using plain-text dispatch`,
   );
-  log.info(`system command detected, plain-text dispatch${suppressReply ? ', reply suppressed' : ''}`);
+  log.info('system command detected, plain-text dispatch');
 
   await dc.core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
     ctx: ctxPayload,
     cfg: dc.accountScopedCfg,
     dispatcherOptions: {
-      deliver: async (payload) => {
-        if (suppressReply) return;
+      deliver: async (payload, info) => {
+        if (suppressToolDetails && info.kind === 'tool') {
+          return;
+        }
+
         const text = payload.text?.trim() ?? '';
         if (!text) return;
         await sendMessageFeishu({
@@ -142,4 +149,12 @@ export async function dispatchSystemCommand(
 
   dc.log(`feishu[${dc.account.accountId}]: system command dispatched (delivered=${delivered})`);
   log.info(`system command dispatched (delivered=${delivered}, elapsed=${ticketElapsed()}ms)`);
+}
+
+function isLifecycleSessionCommand(text: string | undefined): boolean {
+  if (!text) return false;
+  const match = text.trim().match(/^\/([^\s@]+)/);
+  if (!match) return false;
+  const command = match[1]?.toLowerCase();
+  return command === 'new' || command === 'reset';
 }

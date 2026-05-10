@@ -9,17 +9,27 @@
  * dependencies needed to process the event.
  */
 
-import type { FeishuMessageEvent, FeishuBotAddedEvent, FeishuReactionCreatedEvent } from '../messaging/types';
+import type {
+  FeishuBotAddedEvent,
+  FeishuMessageEvent,
+  FeishuReactionCreatedEvent,
+  FeishuVcMeetingInvitedEvent,
+} from '../messaging/types';
 import { handleFeishuMessage } from '../messaging/inbound/handler';
 import { handleFeishuReaction, resolveReactionContext } from '../messaging/inbound/reaction-handler';
+import { handleFeishuCommentEvent } from '../messaging/inbound/comment-handler';
+import { handleFeishuVcMeetingInvited } from '../messaging/inbound/vc-meeting-invited-handler';
+import { resolveVcSender } from '../messaging/inbound/vc-sender';
+import { parseFeishuDriveCommentNoticeEventPayload } from '../messaging/inbound/comment-context';
 import { isMessageExpired } from '../messaging/inbound/dedup';
 import { withTicket } from '../core/lark-ticket';
 import { larkLogger } from '../core/lark-logger';
 import { handleCardAction } from '../tools/auto-auth';
 import { handleAskUserAction } from '../tools/ask-user-question';
-import { enqueueFeishuChatTask, buildQueueKey, hasActiveTask, getActiveDispatcher } from './chat-queue';
+import { buildQueueKey, enqueueFeishuChatTask, getActiveDispatcher, hasActiveTask } from './chat-queue';
 import { extractRawTextFromEvent, isLikelyAbortText } from './abort-detect';
 import type { MonitorContext } from './types';
+import { dispatchFeishuPluginInteractiveHandler } from './interactive-dispatch';
 
 const elog = larkLogger('channel/event-handlers');
 
@@ -63,6 +73,23 @@ export async function handleMessageEvent(ctx: MonitorContext, data: unknown): Pr
   const { accountId, log, error } = ctx;
   try {
     const event = data as FeishuMessageEvent;
+
+    // Self-echo hard filter — drop messages authored by this very bot before
+    // dedup and enqueue. Prevents self-reply loops; the primary guardrail
+    // against bot-to-bot ping-pong.
+    //
+    // NOTE: if botOpenId is not yet populated (startup race before probe
+    // resolves), this filter is skipped. The downstream bot-sender gate
+    // (checkBotSenderGate) acts as fallback — bot messages default to
+    // `allowBots='mentions'`, so in groups they require an explicit @-mention
+    // of this bot to pass; DMs are pass-through under the default.
+    const senderOpenId = event.sender?.sender_id?.open_id;
+    const botOpenId = ctx.lark.botOpenId;
+    if (botOpenId && senderOpenId && senderOpenId === botOpenId) {
+      log(`feishu[${accountId}]: drop self-echo message ${event.message?.message_id ?? 'unknown'}`);
+      return;
+    }
+
     const msgId = event.message?.message_id ?? 'unknown';
     const chatId = event.message?.chat_id ?? '';
     // In topic groups, reply events carry root_id but not thread_id.
@@ -238,18 +265,157 @@ export async function handleBotMembershipEvent(
 }
 
 // ---------------------------------------------------------------------------
+// VC meeting invited handler
+// ---------------------------------------------------------------------------
+
+export async function handleVcMeetingInvitedEvent(ctx: MonitorContext, data: unknown): Promise<void> {
+  if (!isEventOwnershipValid(ctx, data)) return;
+  const { accountId, log, error } = ctx;
+  try {
+    const event = data as FeishuVcMeetingInvitedEvent;
+    const meetingNo = event.meeting?.meeting_no?.trim() ?? '';
+    const eventId = event.event_id?.trim() ?? '';
+    // Resolve the inviter identity through the shared helper so the
+    // diagnostics log and the dispatch handler always agree on the
+    // same sender semantics.
+    const sender = resolveVcSender(event);
+    const senderId = sender.senderId;
+    const invitedBotOpenId = event.bot?.id?.open_id?.trim() ?? '';
+
+    // VC invited origin/ownership diagnostics:
+    // - This handler is only reachable from the WebSocket monitor path.
+    // - We still log app_id/bot_open_id so operators can confirm the event
+    //   is delivered to the expected bot/account, and see which required
+    //   fields are missing when we skip.
+    const expectedAppId = ctx.lark.account.appId ?? '';
+    const eventAppId = event.app_id?.trim() ?? '';
+    log(
+      `feishu[${accountId}]: vc invited event received (ingress=websocket)` +
+        `${eventId ? ` event_id=${eventId}` : ''}` +
+        `${eventAppId ? ` app_id=${eventAppId}` : ' app_id=<missing>'}` +
+        `${expectedAppId ? ` expected_app_id=${expectedAppId}` : ''}` +
+        `${invitedBotOpenId ? ` bot_open_id=${invitedBotOpenId}` : ' bot_open_id=<missing>'}` +
+        `${ctx.lark.botOpenId ? ` expected_bot_open_id=${ctx.lark.botOpenId}` : ''}` +
+        `${event.invite_time ? ` invite_time=${event.invite_time}` : ''}` +
+        ` meeting_no_present=${meetingNo ? 'true' : 'false'}` +
+        ` sender_present=${senderId ? 'true' : 'false'}` +
+        ` sender_from=${sender.fromFallback}`,
+    );
+
+    if (!meetingNo) {
+      log(`feishu[${accountId}]: vc invited event missing meeting_no, skipping`);
+      return;
+    }
+
+    if (!senderId) {
+      log(`feishu[${accountId}]: vc invited event missing inviter identity, skipping`);
+      return;
+    }
+
+    if (ctx.lark.botOpenId && invitedBotOpenId && invitedBotOpenId !== ctx.lark.botOpenId) {
+      log(
+        `feishu[${accountId}]: vc invited event for another bot, expected=${ctx.lark.botOpenId}, got=${invitedBotOpenId}, skipping`,
+      );
+      return;
+    }
+
+    // Prefer event_id when the SDK exposes it: historical raw payload logs
+    // show WebSocket reconnect replays reuse the same event_id, while a real
+    // second invitation yields a new event_id even for the same meeting/bot.
+    // Fallback to (meeting_no, bot) only when event_id is absent so older
+    // payload shapes still remain deduplicated.
+    const dedupBotKey = ctx.lark.botOpenId ?? invitedBotOpenId ?? 'no-bot';
+    const dedupKey = eventId ? `vc-invited:by-event:${eventId}` : `vc-invited:by-meeting:${meetingNo}:${dedupBotKey}`;
+    if (!ctx.messageDedup.tryRecord(dedupKey, accountId)) {
+      log(`feishu[${accountId}]: duplicate vc invited event detected, skipping`);
+      return;
+    }
+
+    log(`feishu[${accountId}]: vc invited event accepted for synthetic dispatch`);
+
+    await handleFeishuVcMeetingInvited({
+      cfg: ctx.cfg,
+      event,
+      runtime: ctx.runtime,
+      chatHistories: ctx.chatHistories,
+      accountId,
+    });
+  } catch (err) {
+    error(`feishu[${accountId}]: error handling vc invited event: ${String(err)}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Drive comment handler
+// ---------------------------------------------------------------------------
+
+export async function handleCommentEvent(ctx: MonitorContext, data: unknown): Promise<void> {
+  if (!isEventOwnershipValid(ctx, data)) return;
+  const { accountId, log, error } = ctx;
+  try {
+    const parsed = parseFeishuDriveCommentNoticeEventPayload(data);
+    if (!parsed) {
+      log(`feishu[${accountId}]: invalid comment event payload, skipping`);
+      return;
+    }
+
+    const commentId = parsed.comment_id ?? '';
+    const replyId = parsed.reply_id ?? '';
+    // Parser has normalized notice_meta fields into canonical top-level fields
+    const _senderOpenId = parsed.user_id?.open_id ?? '';
+    const isMentioned = parsed.is_mention ?? false;
+    const eventTimestamp = parsed.action_time;
+
+    log(
+      `feishu[${accountId}]: drive comment event: ` +
+        `type=${parsed.file_type}, comment=${commentId}` +
+        `${replyId ? `, reply=${replyId}` : ''}` +
+        `${isMentioned ? ', @bot' : ''}`,
+    );
+
+    // Dedup: build a deterministic key from the comment/reply IDs
+    const dedupKey = replyId ? `comment:${commentId}:reply:${replyId}` : `comment:${commentId}`;
+    if (!ctx.messageDedup.tryRecord(dedupKey, accountId)) {
+      log(`feishu[${accountId}]: duplicate comment event ${dedupKey}, skipping`);
+      return;
+    }
+
+    // Expiry check
+    if (isMessageExpired(eventTimestamp)) {
+      log(`feishu[${accountId}]: comment event expired, discarding`);
+      return;
+    }
+
+    // Dispatch the comment event (no queue serialization needed for comment threads)
+    await handleFeishuCommentEvent({
+      cfg: ctx.cfg,
+      event: parsed,
+      botOpenId: ctx.lark.botOpenId,
+      runtime: ctx.runtime,
+      chatHistories: ctx.chatHistories,
+      accountId,
+    });
+  } catch (err) {
+    error(`feishu[${accountId}]: error handling comment event: ${String(err)}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Card action handler
 // ---------------------------------------------------------------------------
 
 export async function handleCardActionEvent(ctx: MonitorContext, data: unknown): Promise<unknown> {
   try {
-    // AskUserQuestion card interactions — injects synthetic message
-    // carrying user answers for the AI to receive in a new turn.
+    // AskUserQuestion：表单卡片交互（宿主内建能力优先）
     const askResult = handleAskUserAction(data, ctx.cfg, ctx.accountId);
     if (askResult !== undefined) return askResult;
 
-    // Auto-auth card actions (OAuth device flow, app scope confirmation)
-    return await handleCardAction(data, ctx.cfg, ctx.accountId);
+    // auto-auth：授权/权限引导相关卡片交互（宿主内建能力优先）
+    const authResult = await handleCardAction(data, ctx.cfg, ctx.accountId);
+    if (authResult !== undefined) return authResult;
+
+    // 业务自定义卡片交互：使用 SDK 标准 interactive dispatch 管道转发给业务插件。
+    return await dispatchFeishuPluginInteractiveHandler({ cfg: ctx.cfg, accountId: ctx.accountId, data });
   } catch (err) {
     elog.warn(`card.action.trigger handler error: ${err}`);
   }

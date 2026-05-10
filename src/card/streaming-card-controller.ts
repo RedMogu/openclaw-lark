@@ -12,14 +12,23 @@
  */
 
 import { readFile } from 'node:fs/promises';
-import { SILENT_REPLY_TOKEN } from 'openclaw/plugin-sdk/reply-runtime';
+import { resolveDefaultAgentId } from 'openclaw/plugin-sdk/agent-runtime';
 import type { ReplyPayload } from 'openclaw/plugin-sdk';
+import { SILENT_REPLY_TOKEN } from 'openclaw/plugin-sdk/reply-runtime';
 import { extractLarkApiCode } from '../core/api-error';
 import { larkLogger } from '../core/lark-logger';
 import { LarkClient } from '../core/lark-client';
 import { registerShutdownHook } from '../core/shutdown-hooks';
 import { sendCardFeishu, updateCardFeishu } from '../messaging/outbound/send';
-import { buildCardContent, STREAMING_ELEMENT_ID, splitReasoningText, stripReasoningTags, toCardKit2 } from './builder';
+import {
+  STREAMING_ELEMENT_ID,
+  buildCardContent,
+  buildStreamingPreAnswerCard,
+  buildStreamingThinkingCard,
+  splitReasoningText,
+  stripReasoningTags,
+  toCardKit2,
+} from './builder';
 import {
   FEISHU_CARD_TABLE_LIMIT,
   isCardRateLimitError,
@@ -36,6 +45,8 @@ import {
 import { FlushController } from './flush-controller';
 import { ImageResolver } from './image-resolver';
 import { optimizeMarkdownStyle } from './markdown-style';
+import { type ToolUseDisplayResult, buildToolUseTitleSuffix, normalizeToolUseDisplay } from './tool-use-display';
+import { clearToolUseTraceRun, getToolUseTraceSteps } from './tool-use-trace-store';
 import type {
   CardKitState,
   CardPhase,
@@ -44,6 +55,7 @@ import type {
   StreamingCardDeps,
   StreamingTextState,
   TerminalReason,
+  ToolUseState,
 } from './reply-dispatcher-types';
 import {
   EMPTY_REPLY_FALLBACK_TEXT,
@@ -65,45 +77,6 @@ interface TerminalCardContentInput {
 }
 
 // ---------------------------------------------------------------------------
-// CardKit 2.0 initial streaming payload
-// ---------------------------------------------------------------------------
-
-const STREAMING_THINKING_CARD = {
-  schema: '2.0',
-  config: {
-    streaming_mode: true,
-    // locales 用于支持多语言摘要展示
-    locales: ['zh_cn', 'en_us'],
-    summary: {
-      content: 'Thinking...',
-      i18n_content: { zh_cn: '思考中...', en_us: 'Thinking...' },
-    },
-  },
-  body: {
-    elements: [
-      {
-        tag: 'markdown',
-        content: '',
-        text_align: 'left',
-        text_size: 'normal_v2',
-        margin: '0px 0px 0px 0px',
-        element_id: STREAMING_ELEMENT_ID,
-      },
-      {
-        tag: 'markdown',
-        content: ' ',
-        icon: {
-          tag: 'custom_icon',
-          img_key: 'img_v3_02vb_496bec09-4b43-4773-ad6b-0cdd103cd2bg',
-          size: '16px 16px',
-        },
-        element_id: 'loading_icon',
-      },
-    ],
-  },
-} as const;
-
-// ---------------------------------------------------------------------------
 // StreamingCardController
 // ---------------------------------------------------------------------------
 
@@ -123,7 +96,9 @@ export class StreamingCardController {
     completedText: '',
     streamingPrefix: '',
     lastPartialText: '',
+    lastFlushedText: '',
   };
+
   private reasoning: ReasoningState = {
     accumulatedReasoningText: '',
     reasoningStartTime: null,
@@ -131,6 +106,11 @@ export class StreamingCardController {
     isReasoningPhase: false,
   };
 
+  private toolUse: ToolUseState = {
+    startedAt: null,
+    elapsedMs: 0,
+    isActive: false,
+  };
   // ---- Sub-controllers ----
   private readonly flush: FlushController;
   private readonly guard: UnavailableGuard;
@@ -177,15 +157,40 @@ export class StreamingCardController {
       const sessionStorePath = cfgWithSession.sessions?.store ?? cfgWithSession.session?.store;
       const key = this.deps.sessionKey.trim().toLowerCase();
 
+      // WORKAROUND: SDK session key round-trip bug.
+      // The SDK's toAgentRequestSessionKey() strips the agent scope from keys
+      // like "agent:hr:main" → "main", then toAgentStoreSessionKey() rebuilds
+      // using the default agent ID → "agent:main:main".  This means metrics
+      // written by the SDK always land under "agent:<defaultAgentId>:…"
+      // regardless of the account-scoped agent ID the plugin routing generated.
+      // Fallback: when the primary key misses, try replacing the agent-id
+      // segment with the resolved default agent ID.
+      // TODO: remove once the SDK preserves the original agent ID during the
+      // request→store key round-trip.
+      const defaultAgentId = resolveDefaultAgentId(this.deps.cfg as Record<string, unknown>);
+      const fallbackKey = key.replace(/^(agent):[^:]+:/, `$1:${defaultAgentId}:`);
+      const candidateKeys = fallbackKey !== key ? [key, fallbackKey] : [key];
+
       const sessionApi = runtime.agent?.session;
       if (sessionApi?.resolveStorePath && sessionApi?.loadSessionStore) {
         const storePath = sessionApi.resolveStorePath(sessionStorePath);
         const store = sessionApi.loadSessionStore(storePath);
-        const entry = store[key];
-        if (!entry || typeof entry !== 'object') {
+
+        let entry: Record<string, unknown> | undefined;
+        let matchedKey: string | undefined;
+        for (const candidate of candidateKeys) {
+          const val = store[candidate];
+          if (val && typeof val === 'object') {
+            entry = val as Record<string, unknown>;
+            matchedKey = candidate;
+            break;
+          }
+        }
+
+        if (!entry) {
           log.debug('footer metrics lookup: session entry missing', {
             sessionKey: this.deps.sessionKey,
-            normalizedSessionKey: key,
+            candidateKeys,
             storePath,
             source: 'runtime.agent.session',
           });
@@ -204,18 +209,9 @@ export class StreamingCardController {
         };
         log.debug('footer metrics lookup: session entry found', {
           sessionKey: this.deps.sessionKey,
-          normalizedSessionKey: key,
+          matchedKey,
           storePath,
           source: 'runtime.agent.session',
-          hasMetrics: !!(
-            metrics.inputTokens != null ||
-            metrics.outputTokens != null ||
-            metrics.cacheRead != null ||
-            metrics.cacheWrite != null ||
-            metrics.totalTokens != null ||
-            metrics.contextTokens != null ||
-            metrics.model
-          ),
         });
         return metrics;
       }
@@ -228,14 +224,26 @@ export class StreamingCardController {
       const storePath = channelSession.resolveStorePath(sessionStorePath);
       const raw = await readFile(storePath, 'utf8');
       const parsed: unknown = JSON.parse(raw);
-      const store = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-        ? (parsed as Record<string, Record<string, unknown>>)
-        : {};
-      const entry = store[key];
-      if (!entry || typeof entry !== 'object') {
+      const store =
+        parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+          ? (parsed as Record<string, Record<string, unknown>>)
+          : {};
+
+      let entry: Record<string, unknown> | undefined;
+      let matchedKey: string | undefined;
+      for (const candidate of candidateKeys) {
+        const val = store[candidate];
+        if (val && typeof val === 'object') {
+          entry = val as Record<string, unknown>;
+          matchedKey = candidate;
+          break;
+        }
+      }
+
+      if (!entry) {
         log.debug('footer metrics lookup: session entry missing', {
           sessionKey: this.deps.sessionKey,
-          normalizedSessionKey: key,
+          candidateKeys,
           storePath,
           source: 'channel.session.file',
         });
@@ -254,18 +262,9 @@ export class StreamingCardController {
       };
       log.debug('footer metrics lookup: session entry found', {
         sessionKey: this.deps.sessionKey,
-        normalizedSessionKey: key,
+        matchedKey,
         storePath,
         source: 'channel.session.file',
-        hasMetrics: !!(
-          metrics.inputTokens != null ||
-          metrics.outputTokens != null ||
-          metrics.cacheRead != null ||
-          metrics.cacheWrite != null ||
-          metrics.totalTokens != null ||
-          metrics.contextTokens != null ||
-          metrics.model
-        ),
       });
       return metrics;
     } catch (err) {
@@ -345,6 +344,33 @@ export class StreamingCardController {
     return this.phase;
   }
 
+  private get shouldDisplayToolUse(): boolean {
+    return this.deps.toolUseDisplay.showToolUse;
+  }
+
+  private computeToolUseDisplay(): ToolUseDisplayResult | null {
+    if (!this.shouldDisplayToolUse) return null;
+    const traceSteps = getToolUseTraceSteps(this.deps.sessionKey);
+    return normalizeToolUseDisplay({
+      traceSteps,
+      showFullPaths: this.deps.toolUseDisplay.showFullPaths,
+      showResultDetails: this.deps.toolUseDisplay.showToolResultDetails,
+    });
+  }
+
+  private get visibleToolUseElapsedMs(): number | undefined {
+    if (!this.shouldDisplayToolUse || !this.toolUse.startedAt) {
+      return undefined;
+    }
+    return this.toolUse.elapsedMs || Date.now() - this.toolUse.startedAt;
+  }
+
+  private computeToolUseTitleSuffix(display: ToolUseDisplayResult | null): { zh: string; en: string } | undefined {
+    if (!this.shouldDisplayToolUse) return undefined;
+    const stepCount = display?.stepCount ?? 0;
+    return stepCount > 0 ? buildToolUseTitleSuffix({ stepCount }) : undefined;
+  }
+
   // ------------------------------------------------------------------
   // Unified callback guard
   // ------------------------------------------------------------------
@@ -393,6 +419,23 @@ export class StreamingCardController {
     this.flush.complete();
     this.disposeShutdownHook?.();
     this.disposeShutdownHook = null;
+    if (this.phase === 'terminated' || this.phase === 'creation_failed') {
+      clearToolUseTraceRun(this.deps.sessionKey);
+    }
+  }
+
+  private markToolUseActivity(): void {
+    if (!this.toolUse.startedAt) {
+      this.toolUse.startedAt = Date.now();
+    }
+    this.toolUse.elapsedMs = Date.now() - this.toolUse.startedAt;
+    this.toolUse.isActive = true;
+  }
+
+  private captureToolUseElapsed(): void {
+    if (!this.toolUse.startedAt) return;
+    this.toolUse.elapsedMs = Date.now() - this.toolUse.startedAt;
+    this.toolUse.isActive = false;
   }
 
   // ------------------------------------------------------------------
@@ -415,6 +458,7 @@ export class StreamingCardController {
     if (!this.shouldProceed('onDeliver.postCreate')) return;
 
     if (!this.cardKit.cardMessageId) return;
+    this.captureToolUseElapsed();
 
     const split = splitReasoningText(text);
 
@@ -466,6 +510,39 @@ export class StreamingCardController {
     await this.throttledCardUpdate();
   }
 
+  async onToolStart(payload: { name?: string; phase?: string }): Promise<void> {
+    if (!this.shouldProceed('onToolStart')) return;
+    if (!this.shouldDisplayToolUse) return;
+    if (payload.phase && payload.phase !== 'start') return;
+
+    this.markToolUseActivity();
+
+    await this.ensureCardCreated();
+    if (!this.shouldProceed('onToolStart.postCreate')) return;
+    if (!this.cardKit.cardMessageId) return;
+    if (!this.text.accumulatedText && this.cardKit.cardKitCardId) {
+      await this.throttledToolUseStatusUpdate();
+      return;
+    }
+    await this.throttledCardUpdate();
+  }
+
+  async onToolPayload(_payload: ReplyPayload): Promise<void> {
+    if (!this.shouldProceed('onToolPayload')) return;
+    if (!this.shouldDisplayToolUse) return;
+
+    this.markToolUseActivity();
+
+    await this.ensureCardCreated();
+    if (!this.shouldProceed('onToolPayload.postCreate')) return;
+    if (!this.cardKit.cardMessageId) return;
+    if (!this.text.accumulatedText && this.cardKit.cardKitCardId) {
+      await this.throttledToolUseStatusUpdate();
+      return;
+    }
+    await this.throttledCardUpdate();
+  }
+
   async onPartialReply(payload: ReplyPayload): Promise<void> {
     if (!this.shouldProceed('onPartialReply')) return;
 
@@ -486,6 +563,7 @@ export class StreamingCardController {
     log.debug('onPartialReply', { len: text.length });
     if (!text) return;
 
+    this.captureToolUseElapsed();
     if (!this.reasoning.reasoningStartTime) {
       this.reasoning.reasoningStartTime = Date.now();
     }
@@ -520,6 +598,7 @@ export class StreamingCardController {
 
     log.error(`${info.kind} reply failed`, { error: String(err) });
 
+    this.captureToolUseElapsed();
     this.finalizeCard('onError', 'error');
 
     await this.flush.waitForFlush();
@@ -528,8 +607,9 @@ export class StreamingCardController {
 
     const errorEffectiveCardId = this.cardKit.cardKitCardId ?? this.cardKit.originalCardKitCardId;
     const footerMetrics = this.needsFooterMetrics() ? await this.getFooterSessionMetrics() : undefined;
-    if (this.cardKit.cardMessageId) {
-      try {
+    const toolUseDisplay = this.computeToolUseDisplay();
+    try {
+      if (this.cardKit.cardMessageId) {
         const rawErrorText = this.text.accumulatedText
           ? `${this.text.accumulatedText}\n\n---\n**Error**: An error occurred while generating the response.`
           : '**Error**: An error occurred while generating the response.';
@@ -544,6 +624,10 @@ export class StreamingCardController {
           text: terminalContent.text,
           reasoningText: terminalContent.reasoningText,
           reasoningElapsedMs: this.reasoning.reasoningElapsedMs || undefined,
+          toolUseSteps: toolUseDisplay?.steps,
+          toolUseTitleSuffix: this.computeToolUseTitleSuffix(toolUseDisplay),
+          toolUseElapsedMs: this.visibleToolUseElapsedMs,
+          showToolUse: this.deps.toolUseDisplay.showToolUse,
           elapsedMs: this.elapsed(),
           isError: true,
           footer: this.deps.resolvedFooter,
@@ -559,9 +643,11 @@ export class StreamingCardController {
             accountId: this.deps.accountId,
           });
         }
-      } catch {
-        // Ignore update failures during error handling
       }
+    } catch {
+      // Ignore update failures during error handling
+    } finally {
+      clearToolUseTraceRun(this.deps.sessionKey);
     }
   }
 
@@ -571,6 +657,7 @@ export class StreamingCardController {
     if (!this.dispatchFullyComplete) return;
 
     if (this.isTerminalPhase) return;
+    this.captureToolUseElapsed();
     this.finalizeCard('onIdle', 'normal');
 
     await this.flush.waitForFlush();
@@ -582,8 +669,8 @@ export class StreamingCardController {
     }
 
     const idleEffectiveCardId = this.cardKit.cardKitCardId ?? this.cardKit.originalCardKitCardId;
-    if (this.cardKit.cardMessageId) {
-      try {
+    try {
+      if (this.cardKit.cardMessageId) {
         if (idleEffectiveCardId) {
           const seqBeforeClose = this.cardKit.cardKitSequence;
           this.cardKit.cardKitSequence += 1;
@@ -611,6 +698,7 @@ export class StreamingCardController {
         // 等待图片异步解析（最多 15s），避免终态卡片留占位符
         const resolvedDisplayText = await this.imageResolver.resolveImagesAwait(displayText, 15_000);
 
+        const idleToolUseDisplay = this.computeToolUseDisplay();
         const terminalContent = prepareTerminalCardContent(
           {
             text: resolvedDisplayText,
@@ -624,6 +712,10 @@ export class StreamingCardController {
           text: terminalContent.text,
           reasoningText: terminalContent.reasoningText,
           reasoningElapsedMs: this.reasoning.reasoningElapsedMs || undefined,
+          toolUseSteps: idleToolUseDisplay?.steps,
+          toolUseTitleSuffix: this.computeToolUseTitleSuffix(idleToolUseDisplay),
+          toolUseElapsedMs: this.visibleToolUseElapsedMs,
+          showToolUse: this.deps.toolUseDisplay.showToolUse,
           elapsedMs: this.elapsed(),
           footer: this.deps.resolvedFooter,
           footerMetrics,
@@ -655,9 +747,11 @@ export class StreamingCardController {
           elapsedMs: this.elapsed(),
           isCardKit: !!idleEffectiveCardId,
         });
-      } catch (err) {
-        log.warn('final card update failed', { error: String(err) });
       }
+    } catch (err) {
+      log.warn('final card update failed', { error: String(err) });
+    } finally {
+      clearToolUseTraceRun(this.deps.sessionKey);
     }
   }
 
@@ -675,6 +769,7 @@ export class StreamingCardController {
 
   async abortCard(): Promise<void> {
     try {
+      this.captureToolUseElapsed();
       if (!this.transition('aborted', 'abortCard', 'abort')) return;
 
       // transition() already executed onEnterTerminalPhase (cancel + complete + dispose hook)
@@ -685,6 +780,7 @@ export class StreamingCardController {
 
       const effectiveCardId = this.cardKit.cardKitCardId ?? this.cardKit.originalCardKitCardId;
       const elapsedMs = Date.now() - this.dispatchStartTime;
+      const abortToolUseDisplay = this.computeToolUseDisplay();
       const terminalContent = prepareTerminalCardContent(
         {
           text: this.text.accumulatedText || 'Aborted.',
@@ -698,6 +794,10 @@ export class StreamingCardController {
           text: terminalContent.text,
           reasoningText: terminalContent.reasoningText,
           reasoningElapsedMs: this.reasoning.reasoningElapsedMs || undefined,
+          toolUseSteps: abortToolUseDisplay?.steps,
+          toolUseTitleSuffix: this.computeToolUseTitleSuffix(abortToolUseDisplay),
+          toolUseElapsedMs: this.visibleToolUseElapsedMs,
+          showToolUse: this.deps.toolUseDisplay.showToolUse,
           elapsedMs,
           isAborted: true,
           footer: this.deps.resolvedFooter,
@@ -711,6 +811,10 @@ export class StreamingCardController {
           text: terminalContent.text,
           reasoningText: terminalContent.reasoningText,
           reasoningElapsedMs: this.reasoning.reasoningElapsedMs || undefined,
+          toolUseSteps: abortToolUseDisplay?.steps,
+          toolUseTitleSuffix: this.computeToolUseTitleSuffix(abortToolUseDisplay),
+          toolUseElapsedMs: this.visibleToolUseElapsedMs,
+          showToolUse: this.deps.toolUseDisplay.showToolUse,
           elapsedMs,
           isAborted: true,
           footer: this.deps.resolvedFooter,
@@ -728,6 +832,8 @@ export class StreamingCardController {
       }
     } catch (err) {
       log.warn('abortCard failed', { error: String(err) });
+    } finally {
+      clearToolUseTraceRun(this.deps.sessionKey);
     }
   }
 
@@ -753,7 +859,7 @@ export class StreamingCardController {
           // Step 1: Create card entity
           const cId = await createCardEntity({
             cfg: this.deps.cfg,
-            card: STREAMING_THINKING_CARD,
+            card: buildStreamingThinkingCard(this.deps.toolUseDisplay.showToolUse),
             accountId: this.deps.accountId,
           });
 
@@ -817,7 +923,9 @@ export class StreamingCardController {
           this.cardKit.cardKitCardId = null;
           this.cardKit.originalCardKitCardId = null;
 
-          const fallbackCard = buildCardContent('thinking');
+          const fallbackCard = buildCardContent('streaming', {
+            showToolUse: this.deps.toolUseDisplay.showToolUse,
+          });
           const result = await sendCardFeishu({
             cfg: this.deps.cfg,
             to: this.deps.chatId,
@@ -881,26 +989,32 @@ export class StreamingCardController {
       const resolvedText = this.imageResolver.resolveImages(displayText);
 
       if (this.cardKit.cardKitCardId) {
-        // CardKit streaming — typewriter effect
-        const prevSeq = this.cardKit.cardKitSequence;
-        this.cardKit.cardKitSequence += 1;
-        log.debug('flushCardUpdate: seq bump', {
-          seqBefore: prevSeq,
-          seqAfter: this.cardKit.cardKitSequence,
-        });
-        await streamCardContent({
-          cfg: this.deps.cfg,
-          cardId: this.cardKit.cardKitCardId,
-          elementId: STREAMING_ELEMENT_ID,
-          content: optimizeMarkdownStyle(resolvedText),
-          sequence: this.cardKit.cardKitSequence,
-          accountId: this.deps.accountId,
-        });
+        if (resolvedText !== this.text.lastFlushedText) {
+          const prevSeq = this.cardKit.cardKitSequence;
+          this.cardKit.cardKitSequence += 1;
+          log.debug('flushCardUpdate: answer seq bump', {
+            seqBefore: prevSeq,
+            seqAfter: this.cardKit.cardKitSequence,
+          });
+          await streamCardContent({
+            cfg: this.deps.cfg,
+            cardId: this.cardKit.cardKitCardId,
+            elementId: STREAMING_ELEMENT_ID,
+            content: optimizeMarkdownStyle(resolvedText),
+            sequence: this.cardKit.cardKitSequence,
+            accountId: this.deps.accountId,
+          });
+          this.text.lastFlushedText = resolvedText;
+        }
       } else {
         log.debug('flushCardUpdate: IM patch fallback');
+        const flushDisplay = this.computeToolUseDisplay();
         const card = buildCardContent('streaming', {
           text: this.reasoning.isReasoningPhase ? '' : resolvedText,
           reasoningText: this.reasoning.isReasoningPhase ? this.reasoning.accumulatedReasoningText : undefined,
+          toolUseSteps: flushDisplay?.steps,
+          toolUseTitleSuffix: this.computeToolUseTitleSuffix(flushDisplay),
+          showToolUse: this.deps.toolUseDisplay.showToolUse,
         });
         await updateCardFeishu({
           cfg: this.deps.cfg,
@@ -957,6 +1071,40 @@ export class StreamingCardController {
     if (this.guard.shouldSkip('throttledCardUpdate')) return;
     const throttleMs = this.cardKit.cardKitCardId ? THROTTLE_CONSTANTS.CARDKIT_MS : THROTTLE_CONSTANTS.PATCH_MS;
     await this.flush.throttledUpdate(throttleMs);
+  }
+
+  // ---- Tool-use status streaming (pre-answer phase) ----
+
+  private lastToolUseStatusUpdateTime = 0;
+
+  private async throttledToolUseStatusUpdate(): Promise<void> {
+    if (!this.cardKit.cardKitCardId) return;
+    const now = Date.now();
+    if (now - this.lastToolUseStatusUpdateTime < THROTTLE_CONSTANTS.REASONING_STATUS_MS) return;
+    this.lastToolUseStatusUpdateTime = now;
+    await this.updateToolUseStatus();
+  }
+
+  private async updateToolUseStatus(): Promise<void> {
+    if (!this.cardKit.cardKitCardId || this.isTerminalPhase) return;
+    try {
+      const display = this.computeToolUseDisplay();
+      const card = buildStreamingPreAnswerCard({
+        steps: display?.steps,
+        elapsedMs: this.visibleToolUseElapsedMs,
+        showToolUse: this.shouldDisplayToolUse,
+      });
+      this.cardKit.cardKitSequence += 1;
+      await updateCardKitCard({
+        cfg: this.deps.cfg,
+        cardId: this.cardKit.cardKitCardId,
+        card,
+        sequence: this.cardKit.cardKitSequence,
+        accountId: this.deps.accountId,
+      });
+    } catch (err) {
+      log.debug('updateToolUseStatus failed', { error: String(err) });
+    }
   }
 
   // ------------------------------------------------------------------

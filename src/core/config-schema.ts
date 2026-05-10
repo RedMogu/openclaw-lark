@@ -8,7 +8,7 @@
  * so that every consuming module can rely on well-typed configuration objects.
  */
 
-import { z, toJSONSchema } from 'zod';
+import { toJSONSchema, z } from 'zod';
 
 export { z };
 
@@ -38,7 +38,7 @@ const AllowFromSchema = z
   .union([z.string(), z.array(z.string())])
   .optional()
   .transform((v) => {
-    if (v === undefined || v === null) return undefined;
+    if (v === undefined || v == null) return undefined;
     return Array.isArray(v) ? v : [v];
   });
 
@@ -116,6 +116,8 @@ const DedupSchema = z
   })
   .optional();
 
+const AllowBotsSchema = z.union([z.boolean(), z.literal('mentions')]).optional();
+
 const ReactionNotificationModeSchema = z.enum(['off', 'own', 'all']).optional();
 
 export const UATConfigSchema = z
@@ -139,11 +141,13 @@ const DmConfigSchema = z
 export const FeishuGroupSchema = z.object({
   groupPolicy: GroupPolicyEnum.optional(),
   requireMention: z.boolean().optional(),
+  respondToMentionAll: z.boolean().optional(),
   tools: ToolPolicySchema,
   skills: z.array(z.string()).optional(),
   enabled: z.boolean().optional(),
   allowFrom: AllowFromSchema,
   systemPrompt: z.string().optional(),
+  allowBots: AllowBotsSchema,
 });
 
 // ---------------------------------------------------------------------------
@@ -166,6 +170,7 @@ export const FeishuAccountConfigSchema = z.object({
   groupPolicy: GroupPolicyEnum.optional(),
   groupAllowFrom: AllowFromSchema,
   requireMention: z.boolean().optional(),
+  respondToMentionAll: z.boolean().optional(),
   groups: z.record(z.string(), FeishuGroupSchema).optional(),
   historyLimit: z.number().optional(),
   dmHistoryLimit: z.number().optional(),
@@ -178,6 +183,11 @@ export const FeishuAccountConfigSchema = z.object({
   replyMode: ReplyModeSchema,
   streaming: z.boolean().optional(),
   blockStreaming: z.boolean().optional(),
+  toolUseDisplay: z
+    .object({
+      showFullPaths: z.boolean().optional(),
+    })
+    .optional(),
   tools: FeishuToolsFlagSchema,
   footer: FeishuFooterSchema,
   markdown: MarkdownConfigSchema,
@@ -186,6 +196,7 @@ export const FeishuAccountConfigSchema = z.object({
   dedup: DedupSchema,
   reactionNotifications: ReactionNotificationModeSchema,
   threadSession: z.boolean().optional(),
+  allowBots: AllowBotsSchema,
   uat: UATConfigSchema,
 });
 
