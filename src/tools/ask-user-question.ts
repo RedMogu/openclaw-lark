@@ -24,6 +24,7 @@ import { randomUUID } from 'node:crypto';
 import type { ClawdbotConfig, OpenClawPluginApi } from 'openclaw/plugin-sdk';
 import { Type } from '@sinclair/typebox';
 import { getTicket, withTicket } from '../core/lark-ticket';
+import { resolveCardCallbackOperatorId } from '../core/card-action-operator';
 import { larkLogger } from '../core/lark-logger';
 import { createCardEntity, sendCardByCardId, updateCardKitCard } from '../card/cardkit';
 import { buildQueueKey, enqueueFeishuChatTask } from '../channel/chat-queue';
@@ -208,7 +209,7 @@ export function handleAskUserAction(data: unknown, _cfg: ClawdbotConfig, account
 
   try {
     const event = data as {
-      operator?: { open_id?: string };
+      operator?: { open_id?: string; user_id?: string };
       open_chat_id?: string;
       context?: { open_chat_id?: string; open_message_id?: string };
       action?: {
@@ -218,7 +219,7 @@ export function handleAskUserAction(data: unknown, _cfg: ClawdbotConfig, account
         value?: Record<string, unknown>;
       };
     };
-    senderOpenId = event.operator?.open_id;
+    senderOpenId = resolveCardCallbackOperatorId(event.operator);
     // open_chat_id may be at top level or inside context (form submit callbacks use context)
     openChatId = event.open_chat_id ?? event.context?.open_chat_id;
     const actionTag = event.action?.tag;

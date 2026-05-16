@@ -29,19 +29,22 @@ import { getUserAgent } from './version';
 const log = larkLogger('core/lark-client');
 
 // ---------------------------------------------------------------------------
-// 注入 User-Agent 到所有飞书 SDK 请求
+// Inject User-Agent into all Feishu SDK requests
 // ---------------------------------------------------------------------------
 
 const GLOBAL_LARK_USER_AGENT_KEY = 'LARK_USER_AGENT';
 
 function installGlobalUserAgent(): void {
-  // node-sdk 内置拦截器最终会读取 global.LARK_USER_AGENT 并覆盖 User-Agent
+  // node-sdk's built-in interceptor reads global.LARK_USER_AGENT to override User-Agent
   (globalThis as Record<string, unknown>)[GLOBAL_LARK_USER_AGENT_KEY] = getUserAgent();
 }
 
 installGlobalUserAgent();
+// Disable axios auto-proxy to prevent HTTP_PROXY env vars from corrupting request URLs.
+// Proxy routing is managed centrally by OpenClaw core's global-agent.
+(Lark.defaultHttpInstance.defaults as Record<string, unknown>).proxy = false;
 Lark.defaultHttpInstance.interceptors.request.handlers = [];
-// 使用 interceptors 在所有 HTTP 请求中注入 User-Agent header
+// Inject User-Agent header into all HTTP requests via interceptor
 Lark.defaultHttpInstance.interceptors.request.use(
   (req) => {
     if (req.headers) {

@@ -184,6 +184,64 @@ describe('reply-dispatcher tool_use mode', () => {
     expect(controllerSpies.onDeliver).not.toHaveBeenCalled();
   });
 
+  it('routes reasoning payload text through the streaming card reasoning lane', async () => {
+    const result = createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: 'main',
+      sessionKey: 'agent:main:feishu:dm:user-1',
+      chatId: 'chat-1',
+      accountId: 'default',
+      chatType: 'p2p',
+      replyInThread: false,
+      skipTyping: true,
+      toolUseDisplay: {
+        mode: 'on',
+        showToolUse: true,
+        showToolResultDetails: false,
+        showFullPaths: false,
+      },
+    });
+
+    result.dispatcher.sendFinalReply({ text: 'Reasoning:\n_checking context_', isReasoning: true });
+    await Promise.resolve();
+
+    expect(controllerSpies.ensureCardCreated).toHaveBeenCalled();
+    expect(controllerSpies.onReasoningStream).toHaveBeenCalledWith({
+      text: 'Reasoning:\n_checking context_',
+      isReasoning: true,
+    });
+    expect(controllerSpies.onDeliver).not.toHaveBeenCalled();
+  });
+
+  it('routes bare reasoning payload text through the streaming card reasoning lane', async () => {
+    const result = createFeishuReplyDispatcher({
+      cfg: {} as never,
+      agentId: 'main',
+      sessionKey: 'agent:main:feishu:dm:user-1',
+      chatId: 'chat-1',
+      accountId: 'default',
+      chatType: 'p2p',
+      replyInThread: false,
+      skipTyping: true,
+      toolUseDisplay: {
+        mode: 'on',
+        showToolUse: true,
+        showToolResultDetails: false,
+        showFullPaths: false,
+      },
+    });
+
+    result.dispatcher.sendFinalReply({ text: 'checking context', isReasoning: true });
+    await Promise.resolve();
+
+    expect(controllerSpies.ensureCardCreated).toHaveBeenCalled();
+    expect(controllerSpies.onReasoningStream).toHaveBeenCalledWith({
+      text: 'checking context',
+      isReasoning: true,
+    });
+    expect(controllerSpies.onDeliver).not.toHaveBeenCalled();
+  });
+
   it('preserves SDK tool-result emission in static mode', () => {
     replyModeState.mode = 'static';
 

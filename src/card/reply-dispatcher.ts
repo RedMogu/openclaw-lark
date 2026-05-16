@@ -39,7 +39,7 @@ export type { CreateFeishuReplyDispatcherParams } from './reply-dispatcher-types
 
 export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherParams): FeishuReplyDispatcherResult {
   const core = LarkClient.runtime;
-  const { cfg, agentId, chatId, sessionKey, replyToMessageId, accountId, replyInThread } = params;
+  const { cfg, agentId, chatId, sessionKey, replyToMessageId, accountId, replyInThread, threadId } = params;
 
   // Resolve account so we can read per-account config (e.g. replyMode)
   const account = getLarkAccount(cfg, accountId);
@@ -92,6 +92,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   const controller = useStreamingCards
     ? new StreamingCardController({
         cfg,
+        agentId,
         sessionKey,
         accountId,
         chatId,
@@ -215,12 +216,13 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
 
       // 提取文本和媒体 URL
       const text = getVisiblePayloadText(payload);
+      const reasoningText = payload.isReasoning === true ? (payload.text ?? '') : '';
       const payloadMediaUrls = payload.mediaUrls?.length
         ? payload.mediaUrls
         : payload.mediaUrl
           ? [payload.mediaUrl]
           : [];
-      if (!text.trim() && payloadMediaUrls.length === 0) {
+      if (!text.trim() && !reasoningText.trim() && payloadMediaUrls.length === 0) {
         log.debug('deliver: empty text and no media, skipping');
         return;
       }
@@ -232,12 +234,17 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
           return;
         }
 
-        if (text.trim()) {
+        const controllerText = reasoningText.trim() ? reasoningText : text;
+        if (controllerText.trim()) {
           await controller.ensureCardCreated();
           if (controller.isTerminated) return;
 
           if (controller.cardMessageId) {
-            await controller.onDeliver({ ...payload, text });
+            if (payload.isReasoning === true) {
+              await controller.onReasoningStream({ ...payload, text: controllerText });
+              return;
+            }
+            await controller.onDeliver({ ...payload, text: controllerText });
             return;
           }
           // Card creation failed — fall through to static delivery
@@ -266,6 +273,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
                   replyToMessageId,
                   replyInThread,
                   accountId,
+                  threadId,
                 });
               } catch (fallbackErr) {
                 if (staticGuard?.terminate('deliver.textFallback', fallbackErr)) return;
@@ -296,6 +304,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
                     replyToMessageId,
                     replyInThread,
                     accountId,
+                    threadId,
                   });
                 } catch (fallbackErr) {
                   if (staticGuard?.terminate('deliver.textFallback', fallbackErr)) return;
@@ -322,6 +331,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
                 replyToMessageId,
                 replyInThread,
                 accountId,
+                threadId,
               });
             } catch (err) {
               if (staticGuard?.terminate('deliver.textChunk', err)) return;

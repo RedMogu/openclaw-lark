@@ -15,13 +15,14 @@
 import type { ClawdbotConfig } from 'openclaw/plugin-sdk';
 // NOTE: This is the SDK-standard interactive pipeline.
 import { dispatchPluginInteractiveHandler } from 'openclaw/plugin-sdk/plugin-runtime';
+import { resolveCardCallbackOperatorId } from '../core/card-action-operator';
 import { larkLogger } from '../core/lark-logger';
 import { sendCardFeishu, sendMessageFeishu, updateCardFeishu } from '../messaging/outbound/send';
 
 const log = larkLogger('channel/interactive-dispatch');
 
 interface FeishuCardActionTriggerEvent {
-  operator?: { open_id?: string };
+  operator?: { open_id?: string; user_id?: string };
   open_chat_id?: string;
   open_message_id?: string;
   context?: { open_chat_id?: string; open_message_id?: string };
@@ -42,7 +43,7 @@ function extractBasics(data: unknown): {
     const openMessageId = ev.open_message_id ?? ev.context?.open_message_id;
     return {
       action: action.trim(),
-      senderOpenId: ev.operator?.open_id,
+      senderOpenId: resolveCardCallbackOperatorId(ev.operator),
       openChatId,
       openMessageId,
     };

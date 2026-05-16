@@ -33,6 +33,7 @@ import type { ClawdbotConfig } from 'openclaw/plugin-sdk';
 import type { ConfiguredLarkAccount, LarkBrand } from '../core/types';
 import type { LarkTicket } from '../core/lark-ticket';
 import { getTicket } from '../core/lark-ticket';
+import { resolveCardCallbackOperatorId } from '../core/card-action-operator';
 import { larkLogger } from '../core/lark-logger';
 
 const log = larkLogger('tools/auto-auth');
@@ -749,12 +750,12 @@ export async function handleCardAction(data: unknown, cfg: ClawdbotConfig, accou
 
   try {
     const event = data as {
-      operator?: { open_id?: string };
+      operator?: { open_id?: string; user_id?: string };
       action?: { value?: { action?: string; operation_id?: string } };
     };
     action = event.action?.value?.action;
     operationId = event.action?.value?.operation_id;
-    senderOpenId = event.operator?.open_id;
+    senderOpenId = resolveCardCallbackOperatorId(event.operator);
   } catch {
     return;
   }
