@@ -7,7 +7,7 @@
 
 import type { ClawdbotConfig } from 'openclaw/plugin-sdk';
 import type { FeishuSendResult, MentionInfo  } from '../types';
-import { createAccountScopedConfig, getLarkAccount } from '../../core/accounts';
+import { getLarkAccount } from '../../core/accounts';
 import { LarkClient } from '../../core/lark-client';
 import { larkLogger } from '../../core/lark-logger';
 import { threadScopedKey } from '../../channel/chat-queue';
@@ -17,6 +17,8 @@ import { optimizeMarkdownStyle } from '../../card/markdown-style';
 import { buildMentionedCardContent, buildMentionedMessage } from '../inbound/mention';
 import { getSentinelStore } from '../inbound/sentinel-store';
 import { type NormalizeContext, type SentinelEntry, normalizeOutboundMentions } from './normalize-mentions';
+import { ensureMention } from './outbound-mention';
+import { currentBotPeerContext } from './bot-peer-context';
 
 const sendLog = larkLogger('outbound/send');
 
@@ -41,7 +43,22 @@ async function normalizeFeishuOutboundText(
       log: (...args) => sendLog.warn(args.map(String).join(' ')),
     };
     const r = await normalizeOutboundMentions(text, ctx);
-    return { text: r.normalizedText, sentinels: r.sentinels, resolvedAccountId: account.accountId };
+    let outText = r.normalizedText;
+    // Deterministic backstop on the real reply path: when this dispatch is
+    // replying to a designated bot peer (set via runWithBotPeerContext in the
+    // inbound dispatch), guarantee an @-mention so the peer actually receives
+    // the message even if the model didn't write one. No-op when no peer is
+    // in scope. De-duped across chunks: once the peer @ has appeared (whether
+    // the model wrote it or we injected it), later chunks of the same reply
+    // are left untouched so we don't @ on every chunk.
+    const peer = currentBotPeerContext();
+    if (peer && !peer.mentioned) {
+      outText = ensureMention(outText, peer.peerOpenId, peer.peerName);
+      if (outText.includes(`user_id="${peer.peerOpenId}"`)) {
+        peer.mentioned = true;
+      }
+    }
+    return { text: outText, sentinels: r.sentinels, resolvedAccountId: account.accountId };
   } catch (err) {
     sendLog.warn(`normalizeOutboundMentions failed, using raw text: ${String(err)}`);
     return { text, sentinels: [], resolvedAccountId: accountId };
@@ -112,33 +129,6 @@ export interface SendFeishuCardParams {
 // ---------------------------------------------------------------------------
 
 /**
- * Resolve the configured markdown table mode for Feishu and convert tables if
- * the runtime converter is available.
- *
- * @param cfg - Plugin configuration
- * @param text - Raw markdown text
- * @param accountId - Optional account identifier for multi-account setups
- * @returns Converted text, or the original text when runtime helpers are unavailable
- */
-function convertMarkdownTablesForFeishu(cfg: ClawdbotConfig, text: string, accountId?: string): string {
-  try {
-    const accountScopedCfg = createAccountScopedConfig(cfg, accountId);
-    const runtime = LarkClient.runtime;
-    if (runtime?.channel?.text?.convertMarkdownTables && runtime.channel.text.resolveMarkdownTableMode) {
-      const tableMode = runtime.channel.text.resolveMarkdownTableMode({
-        cfg: accountScopedCfg,
-        channel: 'feishu',
-      });
-      return runtime.channel.text.convertMarkdownTables(text, tableMode);
-    }
-  } catch {
-    // Runtime not available -- use the text as-is.
-  }
-
-  return text;
-}
-
-/**
  * Send a text message (rendered as a Feishu "post" with markdown support)
  * to a chat or user.
  *
@@ -147,8 +137,8 @@ function convertMarkdownTablesForFeishu(cfg: ClawdbotConfig, text: string, accou
  * sent as a threaded reply; otherwise it is sent as a new message using
  * the appropriate `receive_id_type`.
  *
- * Markdown tables in the text are automatically converted to the format
- * supported by Feishu via the runtime's table converter when available.
+ * Markdown tables and code blocks are sent as-is so Feishu renders them
+ * natively in the post(`tag:md`); only `optimizeMarkdownStyle` is applied.
  *
  * @param params - See {@link SendFeishuMessageParams}.
  * @returns The send result containing the new message ID.
@@ -185,9 +175,6 @@ export async function sendMessageFeishu(params: SendFeishuMessageParams): Promis
         processed = buildMentionedMessage(mentions, processed);
       }
 
-      // Convert markdown tables to Feishu-compatible format.
-      processed = convertMarkdownTablesForFeishu(cfg, processed, accountId);
-
       // Apply Markdown style optimization.
       processed = optimizeMarkdownStyle(processed, 1);
 
@@ -204,9 +191,6 @@ export async function sendMessageFeishu(params: SendFeishuMessageParams): Promis
     if (mentions && mentions.length > 0) {
       messageText = buildMentionedMessage(mentions, messageText);
     }
-
-    // Convert markdown tables to Feishu-compatible format.
-    messageText = convertMarkdownTablesForFeishu(cfg, messageText, accountId);
 
     // Apply Markdown style optimization.
     messageText = optimizeMarkdownStyle(messageText, 1);
@@ -482,14 +466,19 @@ export async function sendMarkdownCardFeishu(params: {
 }): Promise<FeishuSendResult> {
   const { cfg, to, text, replyToMessageId, mentions, accountId, replyInThread } = params;
 
-  let cardText = text;
+  // Normalize @-mentions and apply the bot-peer ensureMention backstop on the
+  // card path too (mirrors sendMessageFeishu), so a reply rendered as a card
+  // still reaches the designated peer bot.
+  const normalized = await normalizeFeishuOutboundText(cfg, to, text, accountId ?? undefined);
+
+  let cardText = normalized.text;
   if (mentions && mentions.length > 0) {
     cardText = buildMentionedCardContent(mentions, cardText);
   }
 
   const card = buildMarkdownCard(cardText);
 
-  return sendCardFeishu({
+  const result = await sendCardFeishu({
     cfg,
     to,
     card,
@@ -497,6 +486,8 @@ export async function sendMarkdownCardFeishu(params: {
     replyInThread,
     accountId,
   });
+  recordFeishuSendSentinels(normalized.resolvedAccountId, to, undefined, normalized.sentinels);
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -524,9 +515,8 @@ export async function editMessageFeishu(params: {
 
   const client = LarkClient.fromCfg(cfg, accountId).sdk;
 
-  const convertedText = convertMarkdownTablesForFeishu(cfg, text, accountId);
   // Use cardVersion=1 consistent with sendMessageFeishu post path.
-  const optimizedText = optimizeMarkdownStyle(convertedText, 1);
+  const optimizedText = optimizeMarkdownStyle(text, 1);
 
   const contentPayload = JSON.stringify({
     zh_cn: {

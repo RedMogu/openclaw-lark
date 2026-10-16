@@ -76,6 +76,9 @@ describe('handleFeishuVcMeetingInvited', () => {
           messageId: 'vc-invited:event:evt_vc_123',
           senderId: 'ou_inviter_1',
           chatType: 'p2p',
+          // When the upstream event has no call_id, the synthetic prompt
+          // omits the call_id instruction entirely so we don't assume the
+          // downstream join tool already accepts that parameter.
           content: 'Use the available tool to join the meeting with meeting number 123456789 immediately. Do not ask for confirmation.',
         }),
         extraInboundFields: expect.objectContaining({
@@ -87,9 +90,39 @@ describe('handleFeishuVcMeetingInvited', () => {
           // @-mention the inviter explicitly when appropriate.
           VcInviterOpenId: 'ou_inviter_1',
           VcInviteTime: '1712345678',
+          VcCallId: undefined,
         }),
         replyToMessageId: undefined,
         skipTyping: true,
+      }),
+    )
+  })
+
+  it('forwards call_id from invite event into synthetic prompt and VcCallId', async () => {
+    readFeishuAllowFromStoreMock.mockResolvedValueOnce(['ou_inviter_1'])
+
+    await handleFeishuVcMeetingInvited({
+      cfg: {} as never,
+      event: {
+        event_id: 'evt_vc_456',
+        meeting: { id: '6911188411934433028', meeting_no: '123456789', topic: '周会' },
+        inviter: { id: { open_id: 'ou_inviter_1' }, user_name: 'Alice' },
+        invite_time: '1712345678',
+        call_id: 'a08e06bf-9a41-44e4-a89c-a7871899e783',
+      },
+      accountId: 'default',
+    })
+
+    expect(dispatchToAgentMock).toHaveBeenCalledTimes(1)
+    expect(dispatchToAgentMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ctx: expect.objectContaining({
+          content:
+            'Use the available tool to join the meeting with meeting number 123456789 immediately. Do not ask for confirmation. When invoking the join tool, pass call_id="a08e06bf-9a41-44e4-a89c-a7871899e783".',
+        }),
+        extraInboundFields: expect.objectContaining({
+          VcCallId: 'a08e06bf-9a41-44e4-a89c-a7871899e783',
+        }),
       }),
     )
   })

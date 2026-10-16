@@ -81,9 +81,22 @@ function buildCodeBlockWithTables(count: number): string {
 // ---------------------------------------------------------------------------
 
 describe('shouldUseCard', () => {
-  it('ignores fenced-code tables when checking the table limit', () => {
+  // scope A (M2 D1): rich text now renders natively as post(`tag:md`); we never
+  // force a card for code blocks / tables. Fenced-code tables still don't count
+  // toward the limit, so this under-limit case stays on the text path (false).
+  it('does not force a card for fenced-code tables (under the table limit)', () => {
     const text = buildCodeBlockWithTables(4);
-    expect(shouldUseCard(text)).toBe(true);
+    expect(shouldUseCard(text)).toBe(false);
+  });
+
+  it('does NOT force a card for plain markdown tables (rendered natively)', () => {
+    const text = [buildTable('a'), buildTable('b')].join('\n\n');
+    expect(shouldUseCard(text)).toBe(false);
+  });
+
+  it('does NOT force a card for a fenced code block (rendered natively)', () => {
+    const text = ['Here is code:', '```ts\nconst x = 1;\n```'].join('\n\n');
+    expect(shouldUseCard(text)).toBe(false);
   });
 });
 

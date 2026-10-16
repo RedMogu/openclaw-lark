@@ -7,6 +7,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { clearPluginInteractiveHandlers, registerPluginInteractiveHandler } from 'openclaw/plugin-sdk/plugin-runtime';
 
 // ---------------------------------------------------------------------------
 // Module mocks (hoisted)
@@ -35,6 +36,10 @@ vi.mock('../src/messaging/inbound/handler', () => ({
   handleFeishuMessage: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock('../src/tools/auto-auth', () => ({
+  handleCardAction: vi.fn(),
+}));
+
 const mockGetTicket = vi.fn();
 const mockWithTicket = vi.fn();
 vi.mock('../src/core/lark-ticket', () => ({
@@ -53,6 +58,8 @@ vi.mock('../src/tools/helpers', () => ({
 // ---------------------------------------------------------------------------
 
 import { handleAskUserAction, registerAskUserQuestionTool } from '../src/tools/ask-user-question';
+import { handleCardActionEvent } from '../src/channel/event-handlers';
+import type { MonitorContext } from '../src/channel/types';
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -62,9 +69,22 @@ const TEST_ACCOUNT_ID = 'test-account';
 const TEST_CHAT_ID = 'oc_test123';
 const TEST_SENDER = 'ou_sender1';
 const TEST_MSG_ID = 'msg_test1';
+const PENDING_QUESTION_TTL_MS = 5 * 60 * 1000;
 
 function createMockCfg() {
   return {} as any;
+}
+
+function createMockMonitorContext(): MonitorContext {
+  return {
+    cfg: createMockCfg(),
+    lark: { account: { appId: 'cli_test' } } as never,
+    accountId: TEST_ACCOUNT_ID,
+    chatHistories: new Map(),
+    messageDedup: { tryRecord: vi.fn(() => true) } as never,
+    log: vi.fn(),
+    error: vi.fn(),
+  };
 }
 
 /**
@@ -73,11 +93,25 @@ function createMockCfg() {
  */
 async function seedPendingQuestion(opts?: {
   questionId?: string;
-  questions?: Array<{ question: string; header: string; options: Array<{ label: string; description: string }>; multiSelect: boolean }>;
+  questions?: Array<{
+    question: string;
+    header: string;
+    options: Array<{ label: string; description: string }>;
+    multiSelect: boolean;
+    selectStyle?: 'dropdown' | 'checkbox';
+  }>;
 }): Promise<string> {
   const cfg = createMockCfg();
   const questions = opts?.questions ?? [
-    { question: '你喜欢什么水果?', header: '水果', options: [{ label: '苹果', description: 'Apple' }, { label: '香蕉', description: 'Banana' }], multiSelect: false },
+    {
+      question: '你喜欢什么水果?',
+      header: '水果',
+      options: [
+        { label: '苹果', description: 'Apple' },
+        { label: '香蕉', description: 'Banana' },
+      ],
+      multiSelect: false,
+    },
   ];
 
   mockGetTicket.mockReturnValue({
@@ -94,7 +128,9 @@ async function seedPendingQuestion(opts?: {
   const registeredTools: Record<string, any> = {};
   const mockApi = {
     config: cfg,
-    registerTool: (def: any) => { registeredTools[def.name] = def; },
+    registerTool: (def: any) => {
+      registeredTools[def.name] = def;
+    },
     logger: { debug: vi.fn() },
   };
   registerAskUserQuestionTool(mockApi as any);
@@ -128,10 +164,12 @@ function createFormSubmitEvent(questionId: string, formValue: Record<string, unk
 describe('AskUserQuestion card callback', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    clearPluginInteractiveHandlers();
     vi.useFakeTimers();
   });
 
   afterEach(() => {
+    clearPluginInteractiveHandlers();
     vi.useRealTimers();
   });
 
@@ -189,6 +227,155 @@ describe('AskUserQuestion card callback', () => {
       expect(result).toBeUndefined();
     });
 
+    it('does not consume non-ask-user form submit actions from other plugins', async () => {
+      await seedPendingQuestion();
+
+      const event = {
+        operator: { open_id: TEST_SENDER },
+        open_chat_id: TEST_CHAT_ID,
+        action: {
+          tag: 'form_submit',
+          name: 'example_form.submit',
+          form_value: {
+            field_a: 'alpha',
+            field_b: 'beta',
+          },
+        },
+      };
+
+      try {
+        const result = handleAskUserAction(event, createMockCfg(), TEST_ACCOUNT_ID);
+
+        expect(result).toBeUndefined();
+      } finally {
+        await vi.advanceTimersByTimeAsync(PENDING_QUESTION_TTL_MS);
+      }
+    });
+
+    it('does not consume business form_submit by form_name when an ask-user question is pending', async () => {
+      await seedPendingQuestion();
+
+      const event = {
+        operator: { open_id: TEST_SENDER },
+        context: {
+          open_chat_id: TEST_CHAT_ID,
+          open_message_id: 'om_business_card',
+        },
+        action: {
+          tag: 'form_submit',
+          form_name: 'example_form.submit',
+          form_value: {
+            field_a: 'alpha',
+            field_b: 'beta',
+          },
+        },
+      };
+
+      try {
+        const result = handleAskUserAction(event, createMockCfg(), TEST_ACCOUNT_ID);
+
+        expect(result).toBeUndefined();
+      } finally {
+        await vi.advanceTimersByTimeAsync(PENDING_QUESTION_TTL_MS);
+      }
+    });
+
+    it('accepts ask-user form_submit by value.action when button name is absent', async () => {
+      const questionId = await seedPendingQuestion();
+
+      const event = {
+        operator: { open_id: TEST_SENDER },
+        context: {
+          open_chat_id: TEST_CHAT_ID,
+          open_message_id: TEST_MSG_ID,
+        },
+        action: {
+          tag: 'form_submit',
+          value: {
+            action: 'ask_user_submit',
+            operation_id: questionId,
+          },
+          form_value: {
+            selection_0: '苹果',
+          },
+        },
+      };
+
+      const result = handleAskUserAction(event, createMockCfg(), TEST_ACCOUNT_ID) as any;
+
+      expect(result.toast.type).toBe('success');
+    });
+
+    it('accepts legacy ask-user form_submit without button name or value.action', async () => {
+      await seedPendingQuestion();
+
+      const event = {
+        operator: { open_id: TEST_SENDER },
+        context: {
+          open_chat_id: TEST_CHAT_ID,
+          open_message_id: TEST_MSG_ID,
+        },
+        action: {
+          tag: 'form_submit',
+          form_value: {
+            selection_0: '苹果',
+          },
+        },
+      };
+
+      const result = handleAskUserAction(event, createMockCfg(), TEST_ACCOUNT_ID) as any;
+
+      expect(result.toast.type).toBe('success');
+    });
+
+    it('routes business form_submit through handleCardActionEvent when ask-user is pending in the same chat', async () => {
+      await seedPendingQuestion();
+
+      const handler = vi.fn().mockReturnValue({ toast: { type: 'success', content: 'business handler reached' } });
+      registerPluginInteractiveHandler('example-plugin', {
+        channel: 'feishu',
+        namespace: 'example_form.submit',
+        handler,
+      });
+
+      const rawEvent = {
+        operator: { open_id: TEST_SENDER },
+        context: {
+          open_chat_id: TEST_CHAT_ID,
+          open_message_id: 'om_business_card',
+        },
+        action: {
+          tag: 'form_submit',
+          form_name: 'example_form.submit',
+          form_value: {
+            field_a: 'alpha',
+            field_b: 'beta',
+          },
+        },
+      };
+
+      try {
+        const result = await handleCardActionEvent(createMockMonitorContext(), rawEvent);
+
+        expect(result).toEqual({ toast: { type: 'success', content: 'business handler reached' } });
+        expect(handler).toHaveBeenCalledWith(
+          expect.objectContaining({
+            channel: 'feishu',
+            accountId: TEST_ACCOUNT_ID,
+            senderId: TEST_SENDER,
+            conversationId: TEST_CHAT_ID,
+            messageId: 'om_business_card',
+            namespace: 'example_form.submit',
+            payload: '',
+            action: 'example_form.submit',
+            rawEvent,
+          }),
+        );
+      } finally {
+        await vi.advanceTimersByTimeAsync(PENDING_QUESTION_TTL_MS);
+      }
+    });
+
     it('returns expired toast for unknown questionId', () => {
       const event = createFormSubmitEvent('non-existent-id', { selection_0: '苹果' });
       const result = handleAskUserAction(event, createMockCfg(), TEST_ACCOUNT_ID) as any;
@@ -209,8 +396,9 @@ describe('AskUserQuestion card callback', () => {
       const body = cardData.body;
 
       // Find markdown elements with answers
-      const markdownElements = findDeep(body, (el: any) =>
-        el?.tag === 'markdown' && typeof el?.content === 'string' && el.content.includes('⏳'),
+      const markdownElements = findDeep(
+        body,
+        (el: any) => el?.tag === 'markdown' && typeof el?.content === 'string' && el.content.includes('⏳'),
       );
       expect(markdownElements.length).toBeGreaterThan(0);
       expect(markdownElements[0].content).toContain('苹果');
@@ -223,8 +411,9 @@ describe('AskUserQuestion card callback', () => {
       const result = handleAskUserAction(event, createMockCfg(), TEST_ACCOUNT_ID) as any;
 
       const cardData = result.card.data;
-      const hintElements = findDeep(cardData.body, (el: any) =>
-        el?.tag === 'markdown' && el?.content === '正在处理你的回答...',
+      const hintElements = findDeep(
+        cardData.body,
+        (el: any) => el?.tag === 'markdown' && el?.content === '正在处理你的回答...',
       );
       expect(hintElements.length).toBe(1);
     });
@@ -352,6 +541,150 @@ describe('AskUserQuestion card callback', () => {
     });
   });
 
+  describe('multi-select checkbox style', () => {
+    it('renders a checker per option when selectStyle is "checkbox"', async () => {
+      await seedPendingQuestion({
+        questions: [
+          {
+            question: '你喜欢哪些水果?',
+            header: '水果',
+            options: [
+              { label: '苹果', description: 'Apple' },
+              { label: '香蕉', description: 'Banana' },
+              { label: '橙子', description: 'Orange' },
+            ],
+            multiSelect: true,
+            selectStyle: 'checkbox',
+          },
+        ],
+      });
+
+      // The interactive form card is the one passed to createCardEntity.
+      const sentCard = mockCreateCardEntity.mock.calls[0][0].card;
+      const checkers = findDeep(sentCard, (el: any) => el?.tag === 'checker');
+
+      // One checker per option, no multi_select_static dropdown.
+      expect(checkers.length).toBe(3);
+      expect(findDeep(sentCard, (el: any) => el?.tag === 'multi_select_static').length).toBe(0);
+
+      // Each checker carries the per-option field name and a value (for 200340).
+      expect(checkers[0].name).toBe('selection_0_0');
+      expect(checkers[1].name).toBe('selection_0_1');
+      expect(checkers[2].name).toBe('selection_0_2');
+      expect(checkers[0].value).toEqual({ option: '苹果' });
+      expect(checkers[0].text.content).toBe('苹果');
+      expect(checkers[0].checked).toBe(false);
+    });
+
+    it('still renders multi_select_static dropdown by default (back-compat)', async () => {
+      await seedPendingQuestion({
+        questions: [
+          {
+            question: '你喜欢哪些水果?',
+            header: '水果',
+            options: [
+              { label: '苹果', description: '' },
+              { label: '香蕉', description: '' },
+            ],
+            multiSelect: true,
+            // selectStyle omitted → default dropdown
+          },
+        ],
+      });
+
+      const sentCard = mockCreateCardEntity.mock.calls[0][0].card;
+      expect(findDeep(sentCard, (el: any) => el?.tag === 'multi_select_static').length).toBe(1);
+      expect(findDeep(sentCard, (el: any) => el?.tag === 'checker').length).toBe(0);
+    });
+
+    it('parses checked checker fields into the answer (boolean and string true)', async () => {
+      const questionId = await seedPendingQuestion({
+        questions: [
+          {
+            question: '你喜欢哪些水果?',
+            header: '水果',
+            options: [
+              { label: '苹果', description: '' },
+              { label: '香蕉', description: '' },
+              { label: '橙子', description: '' },
+            ],
+            multiSelect: true,
+            selectStyle: 'checkbox',
+          },
+        ],
+      });
+
+      // 苹果 checked (boolean), 香蕉 unchecked (false), 橙子 checked (string 'true').
+      const event = createFormSubmitEvent(questionId, {
+        selection_0_0: true,
+        selection_0_1: false,
+        selection_0_2: 'true',
+      });
+      const result = handleAskUserAction(event, createMockCfg(), TEST_ACCOUNT_ID) as any;
+
+      // Submit succeeds (question is answered, not flagged unanswered).
+      expect(result.toast.type).toBe('success');
+
+      // The processing card should reflect the selected labels, comma-joined.
+      const answerEls = findDeep(
+        result.card.data.body,
+        (el: any) => el?.tag === 'markdown' && typeof el?.content === 'string' && el.content.includes('⏳'),
+      );
+      expect(answerEls.length).toBe(1);
+      expect(answerEls[0].content).toContain('苹果');
+      expect(answerEls[0].content).toContain('橙子');
+      expect(answerEls[0].content).not.toContain('香蕉');
+    });
+
+    it('parses a real Feishu form_submit payload (boolean checker values)', async () => {
+      const questionId = await seedPendingQuestion({
+        questions: [
+          {
+            question: '你想总结哪几个群？（可多选）',
+            header: '选择群',
+            options: [
+              { label: 'Neo Wu Test', description: '' },
+              { label: 'Hyclaw 产研', description: '' },
+              { label: '巡检场景快速落地HyClaw', description: '' },
+              { label: '资金中心项目-客诉群', description: '' },
+              { label: '资金中心项目-产研群', description: '' },
+              { label: '资金中心项目-研发群', description: '' },
+            ],
+            multiSelect: true,
+            selectStyle: 'checkbox',
+          },
+        ],
+      });
+
+      // Real form_value captured from a Feishu card.action.trigger submit
+      // (6 checkboxes, options 1 and 2 checked). Feishu reports each checker's
+      // state as a JSON boolean, keyed by the per-option field name. Keeping a
+      // real sample here pins the parser to the actual payload shape.
+      const event = createFormSubmitEvent(questionId, {
+        selection_0_0: false,
+        selection_0_1: true,
+        selection_0_2: true,
+        selection_0_3: false,
+        selection_0_4: false,
+        selection_0_5: false,
+      });
+      const result = handleAskUserAction(event, createMockCfg(), TEST_ACCOUNT_ID) as any;
+
+      expect(result.toast.type).toBe('success');
+
+      const answerEls = findDeep(
+        result.card.data.body,
+        (el: any) => el?.tag === 'markdown' && typeof el?.content === 'string' && el.content.includes('⏳'),
+      );
+      expect(answerEls.length).toBe(1);
+      // Only the two checked options appear, in option order.
+      expect(answerEls[0].content).toContain('Hyclaw 产研');
+      expect(answerEls[0].content).toContain('巡检场景快速落地HyClaw');
+      expect(answerEls[0].content).not.toContain('Neo Wu Test');
+      expect(answerEls[0].content).not.toContain('资金中心项目-客诉群');
+    });
+  });
+
   describe('multi-question form', () => {
     it('handles multiple questions in processing card', async () => {
       const questionId = await seedPendingQuestion({
@@ -372,8 +705,9 @@ describe('AskUserQuestion card callback', () => {
       expect(cardData.header.subtitle.content).toContain('2');
 
       // Both answers should appear in the card
-      const allMarkdown = findDeep(cardData.body, (el: any) =>
-        el?.tag === 'markdown' && typeof el?.content === 'string' && el.content.includes('⏳'),
+      const allMarkdown = findDeep(
+        cardData.body,
+        (el: any) => el?.tag === 'markdown' && typeof el?.content === 'string' && el.content.includes('⏳'),
       );
       expect(allMarkdown.length).toBe(2);
     });
